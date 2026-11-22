@@ -1,0 +1,3 @@
+[tools]
+"aqua:ninja-build/ninja" = "1.12.1"
+"pypi:meson" = "1.6.1"
