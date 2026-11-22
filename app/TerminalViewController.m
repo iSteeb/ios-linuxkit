@@ -10,6 +10,8 @@
 #import "TerminalView.h"
 #import "BarButton.h"
 #import "ArrowBarButton.h"
+#import "ExtraKeysBarView.h"
+#import "ExtraKeysEditorViewController.h"
 #import "UserPreferences.h"
 #import "AboutViewController.h"
 #import "NSObject+SaneKVO.h"
@@ -43,6 +45,8 @@
 @property (weak, nonatomic) IBOutlet UIButton *infoButton;
 @property (weak, nonatomic) IBOutlet UIButton *pasteButton;
 @property (weak, nonatomic) IBOutlet UIButton *hideKeyboardButton;
+
+@property (strong, nonatomic) ExtraKeysBarView *extraKeysBar;
 
 @property int sessionPid;
 @property (nonatomic) Terminal *sessionTerminal;
@@ -86,6 +90,24 @@
                selector:@selector(keyboardDidSomething:)
                    name:UIKeyboardDidChangeFrameNotification
                  object:nil];
+
+    self.extraKeysBar = [[ExtraKeysBarView alloc] initWithFrame:CGRectZero];
+    self.extraKeysBar.onEscape = ^{ [self pressKey:@"\x1b"]; };
+    self.extraKeysBar.onTab = ^{ [self pressKey:@"\t"]; };
+    self.extraKeysBar.onKey = ^(NSString *key) { [self pressKey:key]; };
+    self.extraKeysBar.onArrow = ^(ArrowDirection direction) {
+        switch (direction) {
+            case ArrowUp: [self pressKey:[self.terminal arrow:'A']]; break;
+            case ArrowDown: [self pressKey:[self.terminal arrow:'B']]; break;
+            case ArrowLeft: [self pressKey:[self.terminal arrow:'D']]; break;
+            case ArrowRight: [self pressKey:[self.terminal arrow:'C']]; break;
+            case ArrowNone: break;
+        }
+    };
+    self.extraKeysBar.onSettings = ^{ [self showAbout:nil]; };
+    // Sticky control handling in TerminalView reads this button's state.
+    self.termView.controlKey = self.extraKeysBar.controlButton;
+
     [self _updateStyleFromPreferences:NO];
     
     if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
@@ -289,19 +311,14 @@
         self.view.backgroundColor = [[UIColor alloc] ish_initWithHexString:UserPreferences.shared.palette.backgroundColor];
         UIKeyboardAppearance keyAppearance = UserPreferences.shared.keyboardAppearance;
         self.termView.keyboardAppearance = keyAppearance;
-        for (BarButton *button in self.barButtons) {
-            button.keyAppearance = keyAppearance;
-        }
-        UIColor *tintColor = keyAppearance == UIKeyboardAppearanceLight ? UIColor.blackColor : UIColor.whiteColor;
-        for (UIControl *control in self.barControls) {
-            control.tintColor = tintColor;
-        }
+        self.extraKeysBar.keyAppearance = keyAppearance;
+        [self.extraKeysBar reloadKeys];
     }];
     UIView *oldBarView = self.termView.inputAccessoryView;
     if (UserPreferences.shared.hideExtraKeysWithExternalKeyboard && self.hasExternalKeyboard) {
         self.termView.inputAccessoryView = nil;
     } else {
-        self.termView.inputAccessoryView = self.barView;
+        self.termView.inputAccessoryView = self.extraKeysBar;
     }
     if (self.termView.inputAccessoryView != oldBarView && self.termView.isFirstResponder) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -338,37 +355,8 @@
     CGRect intersection = CGRectIntersection(keyboardFrame, self.view.bounds);
     BOOL intersects = !CGRectIsNull(intersection) && !CGRectIsEmpty(intersection);
     self.hasExternalKeyboard = !intersects || intersection.size.height < 100;
-    if (@available(iOS 15.0, *))
-        return; // UIKit's layout guide handles keyboard movement and safe areas.
-
-    keyboardFrame = intersects ? intersection : CGRectZero;
-    CGFloat pad = self.view.safeAreaInsets.bottom;
-    // The keyboard appears to be undocked. This means it can either be split or
-    // truly floating. In the former case we want to keep the pad, but in the
-    // latter we should fall back to the input accessory view instead of the
-    // keyboard.
-    if (intersects) {
-        pad = CGRectGetMaxY(self.view.bounds) - CGRectGetMinY(keyboardFrame);
-    }
-    if (intersects && pad != keyboardFrame.size.height && keyboardFrame.size.width != self.view.bounds.size.width) {
-        pad = MAX(self.view.safeAreaInsets.bottom, self.termView.inputAccessoryView.frame.size.height);
-    }
-    self.bottomConstraint.constant = pad;
-
-    BOOL initialLayout = self.termView.needsUpdateConstraints;
-    [self.view setNeedsUpdateConstraints];
-    if (!initialLayout) {
-        // if initial layout hasn't happened yet, the terminal view is going to be at a really weird place, so animating it is going to look really bad
-        NSNumber *interval = notification.userInfo[UIKeyboardAnimationDurationUserInfoKey];
-        NSNumber *curve = notification.userInfo[UIKeyboardAnimationCurveUserInfoKey];
-        [UIView animateWithDuration:interval.doubleValue
-                              delay:0
-                            options:curve.integerValue << 16
-                         animations:^{
-                             [self.view layoutIfNeeded];
-                         }
-                         completion:nil];
-    }
+    // On iOS 15+ the keyboard layout guide owns keyboard movement and safe
+    // areas; the legacy manual-inset math below was removed with it.
 }
 
 - (void)setHasExternalKeyboard:(BOOL)hasExternalKeyboard {
@@ -412,28 +400,9 @@
 }
 
 - (void)resizeBar {
-    CGSize bar = self.barView.bounds.size;
-    // set sizing parameters on bar
-    // numbers stolen from iVim and modified somewhat
-    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone) {
-        // phone
-        [self setBarHorizontalPadding:6 verticalPadding:6 buttonWidth:32];
-    } else if (bar.width >= 450) {
-        // wide ipad
-        [self setBarHorizontalPadding:15 verticalPadding:8 buttonWidth:43];
-    } else {
-        // narrow ipad (slide over)
-        [self setBarHorizontalPadding:10 verticalPadding:8 buttonWidth:36];
-    }
-    [UIView performWithoutAnimation:^{
-        [self.barView layoutIfNeeded];
-    }];
-}
-
-- (void)setBarHorizontalPadding:(CGFloat)horizontal verticalPadding:(CGFloat)vertical buttonWidth:(CGFloat)buttonWidth {
-    self.barLeading.constant = self.barTrailing.constant = horizontal;
-    self.barTop.constant = self.barBottom.constant = vertical;
-    self.barButtonWidth.constant = buttonWidth;
+    CGSize bar = self.termView.inputAccessoryView.bounds.size;
+    // The accessory bar sizes itself with autolayout; nothing to resize here.
+    (void)bar;
 }
 
 - (IBAction)pressEscape:(id)sender {

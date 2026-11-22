@@ -13,11 +13,13 @@
 #import "UserPreferences.h"
 #import "iOSFS.h"
 #import "MountsViewController.h"
+#import "ExtraKeysEditorViewController.h"
 #import "UIApplication+OpenURL.h"
 #import "NSObject+SaneKVO.h"
 
 @interface AboutViewController ()
 @property (weak, nonatomic) IBOutlet UITableViewCell *capsLockMappingCell;
+@property (weak, nonatomic) IBOutlet UITableViewCell *extraKeysCell;
 @property (weak, nonatomic) IBOutlet UITableViewCell *themeCell;
 @property (weak, nonatomic) IBOutlet UISwitch *disableDimmingSwitch;
 @property (weak, nonatomic) IBOutlet UITextField *launchCommandField;
@@ -101,6 +103,8 @@
         [UIApplication openURL:@"https://github.com/rcarmo/ios-linuxkit/issues"];
     } else if (cell == self.mountsCell) {
         [self.navigationController pushViewController:[MountsViewController new] animated:YES];
+    } else if (cell == self.extraKeysCell) {
+        [self.navigationController pushViewController:[[ExtraKeysEditorViewController alloc] init] animated:YES];
     } else if (cell == self.exportContainerCell) {
         // copy the files to the app container so they can be extracted from iTunes file sharing
         NSURL *container = ContainerURL();

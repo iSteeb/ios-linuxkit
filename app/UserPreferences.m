@@ -22,6 +22,7 @@ static NSString *const kPreferenceThemeKey = @"ModernTheme";
 static NSString *const kPreferenceDisableDimmingKey = @"Disable Dimming";
 NSString *const kPreferenceLaunchCommandKey = @"Init Command";
 NSString *const kPreferenceBootCommandKey = @"Boot Command";
+static NSString *const kPreferenceExtraKeysKey = @"Extra Keys";
 static NSString *const kPreferenceCursorStyleKey = @"Cursor Style";
 static NSString *const kPreferenceBlinkCursorKey = @"Blink Cursor";
 NSString *const kPreferenceHideStatusBarKey = @"Status Bar";
@@ -167,6 +168,7 @@ bool (*remove_user_default)(const char *name);
             kPreferenceDisableDimmingKey: @(NO),
             kPreferenceLaunchCommandKey: @[@"/bin/login", @"-f", @"root"],
             kPreferenceBootCommandKey: @[@"/sbin/init"],
+            kPreferenceExtraKeysKey: @[@"/", @"~", @"-", @"|", @"\\", @"$", @":settings"],
             kPreferenceBlinkCursorKey: @(NO),
             kPreferenceCursorStyleKey: @(CursorStyleBlock),
             kPreferenceHideStatusBarKey: @(NO),
@@ -219,6 +221,7 @@ bool (*remove_user_default)(const char *name);
             kPreferenceDisableDimmingKey: property(shouldDisableDimming),
             kPreferenceLaunchCommandKey: property(launchCommand),
             kPreferenceBootCommandKey: property(bootCommand),
+            kPreferenceExtraKeysKey: property(extraKeys),
             kPreferenceCursorStyleKey: property(cursorStyle),
             kPreferenceBlinkCursorKey: property(blinkCursor),
             kPreferenceHideStatusBarKey: property(hideStatusBar),
@@ -490,6 +493,19 @@ bool (*remove_user_default)(const char *name);
 
 - (void)setBootCommand:(NSArray<NSString *> *)bootCommand {
     [_defaults setObject:bootCommand forKey:kPreferenceBootCommandKey];
+}
+
+// MARK: extraKeys
+- (NSArray<NSString *> *)extraKeys {
+    NSArray<NSString *> *keys = [_defaults stringArrayForKey:kPreferenceExtraKeysKey];
+    if (keys == nil) {
+        keys = @[@"/", @"~", @"-", @"|", @"\\", @"$", @":settings"];
+    }
+    return keys;
+}
+
+- (void)setExtraKeys:(NSArray<NSString *> *)extraKeys {
+    [_defaults setObject:extraKeys forKey:kPreferenceExtraKeysKey];
 }
 
 - (BOOL)validateBootCommand:(id *)value error:(NSError **)error {

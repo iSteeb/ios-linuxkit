@@ -85,6 +85,23 @@
                                             <segue destination="Zzy-IN-laJ" kind="show" id="3W3-8y-gVF"/>
                                         </connections>
                                     </tableViewCell>
+                                    <tableViewCell clipsSubviews="YES" contentMode="scaleToFill" preservesSuperviewLayoutMargins="YES" selectionStyle="default" accessoryType="disclosureIndicator" indentationWidth="10" textLabel="exk-K1-lbl" style="IBUITableViewCellStyleDefault" id="exk-K1-cell" userLabel="Extra Keys">
+                                        <rect key="frame" x="0.0" y="105" width="320" height="43.5"/>
+                                        <autoresizingMask key="autoresizingMask"/>
+                                        <tableViewCellContentView key="contentView" opaque="NO" clipsSubviews="YES" multipleTouchEnabled="YES" contentMode="center" preservesSuperviewLayoutMargins="YES" insetsLayoutMarginsFromSafeArea="NO" tableViewCell="exk-K1-cell" id="exk-K1-cv">
+                                            <rect key="frame" x="0.0" y="0.0" width="293.5" height="43.5"/>
+                                            <autoresizingMask key="autoresizingMask"/>
+                                            <subviews>
+                                                <label opaque="NO" multipleTouchEnabled="YES" contentMode="left" insetsLayoutMarginsFromSafeArea="NO" text="Extra Keys" textAlignment="natural" lineBreakMode="tailTruncation" baselineAdjustment="alignBaselines" adjustsFontSizeToFit="NO" id="exk-K1-lbl">
+                                                    <rect key="frame" x="16" y="0.0" width="269.5" height="43.5"/>
+                                                    <autoresizingMask key="autoresizingMask"/>
+                                                    <fontDescription key="fontDescription" type="system" pointSize="17"/>
+                                                    <nil key="textColor"/>
+                                                    <nil key="highlightedColor"/>
+                                                </label>
+                                            </subviews>
+                                        </tableViewCellContentView>
+                                    </tableViewCell>
                                     <tableViewCell clipsSubviews="YES" contentMode="scaleToFill" preservesSuperviewLayoutMargins="YES" selectionStyle="none" indentationWidth="10" id="3CC-Gj-X6f" userLabel="Disable Dimming">
                                         <rect key="frame" x="0.0" y="148.5" width="320" height="43.5"/>
                                         <autoresizingMask key="autoresizingMask"/>
@@ -318,6 +335,7 @@
                         <outlet property="capsLockMappingCell" destination="31N-0g-RhF" id="UjF-21-3df"/>
                         <outlet property="disableDimmingSwitch" destination="cPj-sQ-qsh" id="Kjp-xA-A0Y"/>
                         <outlet property="exportContainerCell" destination="OIE-9g-Btx" id="qxo-l5-0Mq"/>
+                        <outlet property="extraKeysCell" destination="exk-K1-cell" id="exk-K1-out"/>
                         <outlet property="launchCommandField" destination="gDx-hv-hhV" id="RQn-gk-Dx8"/>
                         <outlet property="mountsCell" destination="mnt-FS-cell" id="mnt-FS-out"/>
                         <outlet property="resetMountsCell" destination="Bqt-ud-CI0" id="2AS-2S-XCr"/>

@@ -69,6 +69,7 @@ extern NSString *const kThemeBackgroundColor;
 @property (readonly) UIStatusBarStyle statusBarStyle;
 @property NSArray<NSString *> *launchCommand;
 @property NSArray<NSString *> *bootCommand;
+@property (copy, null_resettable) NSArray<NSString *> *extraKeys;
 @property NSString *hostnameOverride;
 // Same as above but returns nil if the user has never set the hostname
 @property (readonly) NSString *_hostnameOverride;
