@@ -48,10 +48,14 @@ typedef struct linux_tty *tty_t;
 @interface CustomWebView : WKWebView
 @end
 @implementation CustomWebView
+- (BOOL)canBecomeFirstResponder {
+    // The native TerminalView owns the keyboard (UIKeyInput). The webview
+    // must never take first responder — taps used to reach its hidden
+    // textarea and steal focus, dismissing the keyboard.
+    return NO;
+}
+
 - (BOOL)becomeFirstResponder {
-    if (@available(iOS 13.4, *)) {
-        return [super becomeFirstResponder];
-    }
     return NO;
 }
 
@@ -60,6 +64,15 @@ typedef struct linux_tty *tty_t;
         return NO;
     }
     return [super canPerformAction:action withSender:sender];
+}
+
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
+    // The webview's own long-press (text loupe/callout) races and cancels
+    // TerminalView's selection gesture; the terminal canvas is not selectable
+    // anyway, so keep native long-press for the app.
+    if ([gestureRecognizer isKindOfClass:[UILongPressGestureRecognizer class]])
+        return NO;
+    return [super gestureRecognizerShouldBegin:gestureRecognizer];
 }
 @end
 
@@ -120,6 +133,7 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
         [config.userContentController addScriptMessageHandler:self name:@"sendInput"];
         [config.userContentController addScriptMessageHandler:self name:@"resize"];
         [config.userContentController addScriptMessageHandler:self name:@"propUpdate"];
+        [config.userContentController addScriptMessageHandler:self name:@"setClipboard"];
         // Make the web view really big so that if a program tries to write to the terminal before it's displayed, the text probably won't wrap too badly.
         CGRect webviewSize = CGRectMake(0, 0, 10000, 10000);
         _webView = [[CustomWebView alloc] initWithFrame:webviewSize configuration:config];
@@ -201,6 +215,14 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
         [self sendInput:data];
     } else if ([message.name isEqualToString:@"resize"]) {
         [self syncWindowSize];
+    } else if ([message.name isEqualToString:@"setClipboard"]) {
+        // OSC 52 writes from the terminal frontend (local or remote programs).
+        if ([message.body isKindOfClass:NSString.class] && [(NSString *)message.body length] > 0 && [(NSString *)message.body length] < 300000) {
+            UIPasteboard.generalPasteboard.string = message.body;
+            NSLog(@"[setClipboard] wrote %lu chars", (unsigned long)[(NSString *)message.body length]);
+        } else {
+            NSLog(@"[setClipboard] rejected payload class=%@", [message.body class]);
+        }
     } else if ([message.name isEqualToString:@"propUpdate"]) {
         if (![message.body isKindOfClass:NSArray.class])
             return;
@@ -214,6 +236,10 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
 }
 
 - (void)syncWindowSize {
+    // Never materialize a web view just to ask its size: background TTY
+    // terminals stay webless until displayed (lazy, one WebProcess total).
+    if (!self.loaded)
+        return;
     NSUInteger requestID;
     @synchronized (self) {
         requestID = ++_windowSizeRequestID;
@@ -254,6 +280,8 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
 
 - (void)setEnableVoiceOverAnnounce:(BOOL)enableVoiceOverAnnounce {
     _enableVoiceOverAnnounce = enableVoiceOverAnnounce;
+    if (!self.loaded)
+        return;
     [self.webView evaluateJavaScript:[NSString stringWithFormat:@"exports.setAccessibilityEnabled(%@)",
                                       enableVoiceOverAnnounce ? @"true" : @"false"]
                    completionHandler:nil];

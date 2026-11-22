@@ -33,24 +33,41 @@ struct rowcol {
 }
 @end
 
-@interface TerminalView () <UIEditMenuInteractionDelegate>
+@interface TerminalView () <UIGestureRecognizerDelegate>
 
 @property (nonatomic) NSMutableArray<UIKeyCommand *> *keyCommands;
 @property ScrollbarView *scrollbarView;
 @property (nonatomic) BOOL terminalFocused;
 @property (nonatomic) BOOL updatingTerminalScroll;
-@property UIEditMenuInteraction *terminalEditMenu API_AVAILABLE(ios(16.0));
 
 @property (nullable) NSString *markedText;
-@property (nullable) NSString *selectedText;
 @property UITextRange *markedRange;
 @property UITextRange *selectedRange;
 
+@property (nonatomic, strong, nullable) UIView *selectionStartHandle;
+@property (nonatomic, strong, nullable) UIView *selectionEndHandle;
+@property (nonatomic, strong, nullable) UIImpactFeedbackGenerator *selectionHaptic;
 @property struct rowcol floatingCursor;
 @property CGSize floatingCursorSensitivity;
 @property CGSize actualFloatingCursorSensitivity;
 
+@property (nonatomic) BOOL scrollUpdateInFlight;
+@property (nonatomic) CGFloat pendingScrollTop;
+@property (nonatomic, strong, nullable) CADisplayLink *autoscrollLink;
+@property (nonatomic) CGPoint autoscrollPoint;
+@property (nonatomic) CGFloat autoscrollVelocity;
+@property (nonatomic, strong, nullable) NSString *autoscrollEndpoint; // "start"/"end" during handle drags, nil during finger drags
+@property (nonatomic, strong, nullable) UILabel *outputPill;
+@property (nonatomic, strong, nullable) UILabel *clipboardToast;
+@property (nonatomic) CGFloat pinchBaseFontSize;
+@property (nonatomic) BOOL selectionDragMode;
+@property (nonatomic, strong, nullable) NSTimer *longPressHoldTimer;
+@property (nonatomic) CGPoint selectionGestureStart;
+@property (nonatomic, strong, nullable) UIEditMenuInteraction *pasteEditMenu API_AVAILABLE(ios(16.0));
+@property (nonatomic, strong, nullable) UIViewPropertyAnimator *toastAnimator;
+
 @end
+
 
 @implementation TerminalView
 @synthesize inputDelegate;
@@ -67,15 +84,27 @@ struct rowcol {
     scrollbarView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     scrollbarView.bounces = NO;
     scrollbarView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    // The app draws its own draggable scrubber; the system indicator would be
+    // a second, non-draggable scrollbar.
+    scrollbarView.showsVerticalScrollIndicator = NO;
+    scrollbarView.showsHorizontalScrollIndicator = NO;
     self.clipsToBounds = YES;
     [self addSubview:scrollbarView];
 #if USE_XTERM_RENDERER
     UILongPressGestureRecognizer *selectionGesture = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(selectTerminalText:)];
+    selectionGesture.delegate = self;
     [self addGestureRecognizer:selectionGesture];
-    if (@available(iOS 16.0, *)) {
-        self.terminalEditMenu = [[UIEditMenuInteraction alloc] initWithDelegate:self];
-        [self addInteraction:self.terminalEditMenu];
-    }
+    UIPinchGestureRecognizer *fontPinch = [[UIPinchGestureRecognizer alloc] initWithTarget:self action:@selector(pinchedFontSize:)];
+    fontPinch.delegate = self;
+    [self addGestureRecognizer:fontPinch];
+    UITapGestureRecognizer *doubleTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(doubleTapped:)];
+    doubleTap.numberOfTapsRequired = 2;
+    doubleTap.delegate = self;
+    [self addGestureRecognizer:doubleTap];
+    UITapGestureRecognizer *singleTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(singleTapped:)];
+    [singleTap requireGestureRecognizerToFail:doubleTap];
+    singleTap.delegate = self;
+    [self addGestureRecognizer:singleTap];
 #endif
 
     UserPreferences *prefs = UserPreferences.shared;
@@ -120,7 +149,7 @@ struct rowcol {
     }
 }
 
-static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight", @"newScrollTop", @"openLink", @"selectionChanged"};
+static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight", @"newScrollTop", @"openLink", @"selectionRect", @"newOutput"};
 
 - (void)setTerminal:(Terminal *)terminal {
     if (_terminal) {
@@ -129,7 +158,6 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
     }
 
     _terminal = terminal;
-    self.selectedText = nil;
     if (_terminal == nil)
         return;
     [self _updateStyle];
@@ -330,9 +358,10 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
     } else if ([message.name isEqualToString:@"openLink"]) {
         if ([message.body isKindOfClass:NSString.class])
             [UIApplication openURL:message.body];
-    } else if ([message.name isEqualToString:@"selectionChanged"]) {
-        if ([message.body isKindOfClass:NSString.class])
-            self.selectedText = message.body;
+        } else if ([message.name isEqualToString:@"selectionRect"]) {
+        [self updateSelectionHandles:[message.body isKindOfClass:NSDictionary.class] ? message.body : nil];
+    } else if ([message.name isEqualToString:@"newOutput"]) {
+        [self showOutputPill];
     }
 }
 
@@ -340,7 +369,27 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
     // Terminal output updates the indicator, not the user's scroll position.
     if (self.updatingTerminalScroll)
         return;
-    [self.terminal.webView evaluateJavaScript:[NSString stringWithFormat:@"exports.newScrollTop(%f)", scrollView.contentOffset.y] completionHandler:nil];
+    self.pendingScrollTop = scrollView.contentOffset.y;
+    if (scrollView.contentOffset.y >= scrollView.contentSize.height - scrollView.bounds.size.height - 1)
+        [self hideOutputPill];
+    if (!self.scrollUpdateInFlight)
+        [self flushScrollUpdate];
+}
+
+// Keep at most one scroll update in flight: during fast flicks, unthrottled
+// evaluateJavaScript calls queue up and the canvas lags badly behind the
+// native momentum. The newest offset always wins.
+- (void)flushScrollUpdate {
+    if (self.terminal == nil || self.terminal.webView == nil)
+        return;
+    self.scrollUpdateInFlight = YES;
+    CGFloat top = self.pendingScrollTop;
+    __weak typeof(self) weakSelf = self;
+    [self.terminal.webView evaluateJavaScript:[NSString stringWithFormat:@"exports.newScrollTop(%f)", top] completionHandler:^(id result, NSError *error) {
+        weakSelf.scrollUpdateInFlight = NO;
+        if (weakSelf.pendingScrollTop != top)
+            [weakSelf flushScrollUpdate];
+    }];
 }
 
 - (void)setKeyboardAppearance:(UIKeyboardAppearance)keyboardAppearance {
@@ -444,56 +493,365 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
     }
 }
 
-- (void)copy:(id)sender {
+#pragma mark - Selection handles and auto-copy
+
+- (UIView *)selectionHandleView {
+    // 44pt touch target, small visual: grabber line + knob at the bottom-center.
+    UIView *handle = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 44, 44)];
+    handle.backgroundColor = UIColor.clearColor;
+    handle.userInteractionEnabled = YES;
+    UIView *line = [[UIView alloc] initWithFrame:CGRectMake(20.5, 4, 3, 24)];
+    line.backgroundColor = UIColor.systemBlueColor;
+    line.layer.cornerRadius = 1.5;
+    UIView *knob = [[UIView alloc] initWithFrame:CGRectMake(15, 26, 14, 14)];
+    knob.backgroundColor = UIColor.systemBlueColor;
+    knob.layer.cornerRadius = 7;
+    [handle addSubview:line];
+    [handle addSubview:knob];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragSelectionHandle:)];
+    [handle addGestureRecognizer:pan];
+    return handle;
+}
+
+- (void)updateSelectionHandles:(NSDictionary *)info {
+    if (info == nil) {
+        [self.selectionStartHandle removeFromSuperview];
+        [self.selectionEndHandle removeFromSuperview];
+        self.selectionStartHandle = nil;
+        self.selectionEndHandle = nil;
+        return;
+    }
+    if (self.selectionStartHandle == nil) {
+        self.selectionStartHandle = [self selectionHandleView];
+        [self addSubview:self.selectionStartHandle];
+        self.selectionEndHandle = [self selectionHandleView];
+        [self addSubview:self.selectionEndHandle];
+        if (self.selectionHaptic == nil)
+            self.selectionHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    }
+    CGFloat cellHeight = [info[@"cellHeight"] doubleValue];
+    NSNumber *sx = info[@"sx"], *sy = info[@"sy"], *ex = info[@"ex"], *ey = info[@"ey"];
+    if (sx == nil || sy == nil || ex == nil || ey == nil || cellHeight <= 0)
+        return;
+    WKWebView *webView = self.terminal.webView;
+    CGPoint start = [webView convertPoint:CGPointMake(sx.doubleValue, sy.doubleValue + cellHeight) toView:self];
+    CGPoint end = [webView convertPoint:CGPointMake(ex.doubleValue, ey.doubleValue + cellHeight) toView:self];
+    // The handle's visual anchor (knob, at the bottom-center of the 44pt box)
+    // sits at the selection edge.
+    self.selectionStartHandle.center = CGPointMake(start.x, start.y + 22);
+    self.selectionEndHandle.center = CGPointMake(end.x, end.y + 22);
+}
+
+- (void)dragSelectionHandle:(UIPanGestureRecognizer *)gesture {
+    if (gesture.view == nil)
+        return;
+    BOOL isStart = gesture.view == self.selectionStartHandle;
+    CGPoint point = [gesture locationInView:self.terminal.webView];
+    if (gesture.state == UIGestureRecognizerStateBegan) {
+        self.scrollbarView.scrollEnabled = NO;
+    }
+    if (gesture.state == UIGestureRecognizerStateBegan || gesture.state == UIGestureRecognizerStateChanged) {
+        [self loupeTrackGesturePoint:point];
+        [self updateAutoscrollForPoint:[gesture locationInView:self] endpoint:isStart ? @"start" : @"end"];
+        NSString *side = isStart ? @"start" : @"end";
+        NSString *script = [NSString stringWithFormat:@"exports.moveSelectionEndpoint('%@',%f,%f)", side, point.x, point.y];
+        [self.terminal.webView evaluateJavaScript:script completionHandler:nil];
+    } else {
+        self.scrollbarView.scrollEnabled = YES;
+        [self hideSelectionLoupe];
+        [self stopAutoscroll];
+        if (gesture.state == UIGestureRecognizerStateEnded)
+            [self copySelectionToPasteboard];
+    }
+}
+
+- (void)copySelectionToPasteboard {
+    __weak typeof(self) weakSelf = self;
     [self.terminal.webView evaluateJavaScript:@"exports.copy()" completionHandler:^(id result, NSError *error) {
-        if (error == nil && [result isKindOfClass:NSString.class] && [result length] > 0)
-            UIPasteboard.generalPasteboard.string = result;
+        if (error != nil || ![result isKindOfClass:NSString.class] || [result length] == 0) {
+            NSLog(@"[selection] copy failed err=%@ result=%@", error, [result class]);
+            return;
+        }
+        UIPasteboard.generalPasteboard.string = result;
+        NSLog(@"[selection] auto-copied %lu chars", (unsigned long)[result length]);
+        [weakSelf showCopyToastWithLength:[result length]];
+        [weakSelf.selectionHaptic prepare];
+        [weakSelf.selectionHaptic impactOccurred];
+        [weakSelf hidePasteMenu];
     }];
 }
 
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
-#if USE_XTERM_RENDERER
-    if (action == @selector(copy:))
-        return self.selectedText.length > 0;
-    if (action == @selector(selectAll:))
-        return self.terminal.loaded;
-#endif
+    if (action == @selector(paste:))
+        return UIPasteboard.generalPasteboard.hasStrings;
     return [super canPerformAction:action withSender:sender];
 }
 
-- (void)selectAll:(id)sender {
-    [self.terminal.webView evaluateJavaScript:@"exports.selectAll?.()" completionHandler:nil];
+- (void)loupeTrackGesturePoint:(CGPoint)pointInWebView {
+    // The loupe is rendered inside the web page (canvas-to-canvas): WebKit's
+    // snapshot APIs deliver too late during gesture tracking to be useful.
+    [self.terminal.webView evaluateJavaScript:[NSString stringWithFormat:@"exports.updateLoupe(%f,%f)", pointInWebView.x, pointInWebView.y] completionHandler:nil];
+}
+
+- (void)hideSelectionLoupe {
+    [self.terminal.webView evaluateJavaScript:@"exports.hideLoupe()" completionHandler:nil];
+}
+
+#pragma mark - Tap gestures (manual keyboard control)
+
+- (BOOL)tapIsOnSelectionHandle:(CGPoint)pointInSelf {
+    // Array literals throw on nil; check each handle explicitly.
+    if (self.selectionStartHandle != nil && CGRectContainsPoint(self.selectionStartHandle.frame, pointInSelf))
+        return YES;
+    if (self.selectionEndHandle != nil && CGRectContainsPoint(self.selectionEndHandle.frame, pointInSelf))
+        return YES;
+    return NO;
+}
+
+- (void)doubleTapped:(UITapGestureRecognizer *)gesture {
+    // The only automatic-free keyboard control: double tap toggles it.
+    if (self.isFirstResponder) {
+        [self resignFirstResponder];
+    } else {
+        [self becomeFirstResponder];
+    }
+}
+
+- (void)singleTapped:(UITapGestureRecognizer *)gesture {
+    if ([self tapIsOnSelectionHandle:[gesture locationInView:self]])
+        return;
+    // A deliberate tap clears a live selection. It never touches the keyboard.
+    if (self.terminal.loaded)
+        [self.terminal.webView evaluateJavaScript:@"exports.clearSelection()" completionHandler:nil];
+}
+
+#pragma mark - Selection edge auto-scroll
+
+static CGFloat const AutoscrollEdgeInset = 56;
+static CGFloat const AutoscrollMaxVelocity = 2400;
+
+- (void)updateAutoscrollForPoint:(CGPoint)pointInSelf endpoint:(nullable NSString *)endpoint {
+    self.autoscrollPoint = pointInSelf;
+    self.autoscrollEndpoint = endpoint;
+    CGRect visible = self.scrollbarView.frame;
+    CGFloat topProximity = pointInSelf.y - CGRectGetMinY(visible);
+    CGFloat bottomProximity = CGRectGetMaxY(visible) - pointInSelf.y;
+    CGFloat velocity = 0;
+    if (topProximity < AutoscrollEdgeInset && topProximity <= bottomProximity) {
+        velocity = -AutoscrollMaxVelocity * (1 - MAX(0, topProximity) / AutoscrollEdgeInset);
+    } else if (bottomProximity < AutoscrollEdgeInset) {
+        velocity = AutoscrollMaxVelocity * (1 - MAX(0, bottomProximity) / AutoscrollEdgeInset);
+    }
+    self.autoscrollVelocity = velocity;
+    if (velocity != 0 && self.autoscrollLink == nil) {
+        self.autoscrollLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(autoscrollTick:)];
+        [self.autoscrollLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    } else if (velocity == 0 && self.autoscrollLink != nil) {
+        [self stopAutoscroll];
+    }
+}
+
+- (void)stopAutoscroll {
+    [self.autoscrollLink invalidate];
+    self.autoscrollLink = nil;
+    self.autoscrollVelocity = 0;
+}
+
+- (void)autoscrollTick:(CADisplayLink *)link {
+    UIScrollView *scrollView = self.scrollbarView;
+    CGFloat offset = scrollView.contentOffset.y + self.autoscrollVelocity * link.duration;
+    CGFloat maxOffset = scrollView.contentSize.height - scrollView.bounds.size.height;
+    if (offset <= 0 || offset >= maxOffset)
+        [self stopAutoscroll];
+    offset = MAX(0, MIN(maxOffset, offset));
+    // Drives scrollViewDidScroll → coalesced JS repaint; no update guard.
+    [scrollView setContentOffset:CGPointMake(scrollView.contentOffset.x, offset) animated:NO];
+    // The viewport moved under the finger: keep extending the selection at the
+    // same on-screen point (cell math is viewport-relative in the bridge).
+    CGPoint webPoint = [self convertPoint:self.autoscrollPoint toView:self.terminal.webView];
+    NSString *script;
+    if (self.autoscrollEndpoint != nil)
+        script = [NSString stringWithFormat:@"exports.moveSelectionEndpoint('%@',%f,%f)", self.autoscrollEndpoint, webPoint.x, webPoint.y];
+    else
+        script = [NSString stringWithFormat:@"exports.extendSelection(%f,%f)", webPoint.x, webPoint.y];
+    [self.terminal.webView evaluateJavaScript:script completionHandler:nil];
+    [self loupeTrackGesturePoint:webPoint];
+}
+
+#pragma mark - Pinch to zoom font
+
+- (void)pinchedFontSize:(UIPinchGestureRecognizer *)gesture {
+    if (gesture.state == UIGestureRecognizerStateBegan) {
+        self.pinchBaseFontSize = UserPreferences.shared.fontSize.doubleValue;
+    } else if (gesture.state == UIGestureRecognizerStateChanged) {
+        CGFloat size = MAX(6, MIN(28, self.pinchBaseFontSize * gesture.scale));
+        double rounded = round(size * 2) / 2;
+        if (fabs(rounded - UserPreferences.shared.fontSize.doubleValue) >= 0.5)
+            UserPreferences.shared.fontSize = @(rounded);
+    }
+}
+
+#pragma mark - Output pill and copy toast
+
+- (void)showOutputPill {
+    if (self.outputPill == nil) {
+        UILabel *pill = [UILabel new];
+        pill.text = @"  ↓  new output  ";
+        pill.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+        pill.textColor = UIColor.whiteColor;
+        pill.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.75];
+        pill.layer.cornerRadius = 14;
+        pill.layer.masksToBounds = YES;
+        pill.textAlignment = NSTextAlignmentCenter;
+        pill.userInteractionEnabled = YES;
+        [pill addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(outputPillTapped:)]];
+        self.outputPill = pill;
+        [self addSubview:pill];
+    }
+    CGRect bounds = self.bounds;
+    self.outputPill.frame = CGRectMake(0, 0, 132, 28);
+    self.outputPill.center = CGPointMake(CGRectGetMidX(bounds), CGRectGetMaxY(bounds) - 44);
+    self.outputPill.hidden = NO;
+    [UIView animateWithDuration:0.15 animations:^{
+        self.outputPill.alpha = 1;
+    }];
+}
+
+- (void)hideOutputPill {
+    [UIView animateWithDuration:0.2 animations:^{
+        self.outputPill.alpha = 0;
+    } completion:^(BOOL finished) {
+        self.outputPill.hidden = YES;
+    }];
+}
+
+- (void)outputPillTapped:(UITapGestureRecognizer *)gesture {
+    [self hideOutputPill];
+    [self.terminal.webView evaluateJavaScript:@"exports.scrollToBottom()" completionHandler:nil];
+}
+
+- (void)showCopyToastWithLength:(NSUInteger)length {
+    if (self.clipboardToast == nil) {
+        UILabel *toast = [UILabel new];
+        toast.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+        toast.textColor = UIColor.whiteColor;
+        toast.backgroundColor = [UIColor colorWithWhite:0 alpha:0.7];
+        toast.layer.cornerRadius = 10;
+        toast.layer.masksToBounds = YES;
+        toast.textAlignment = NSTextAlignmentCenter;
+        toast.userInteractionEnabled = NO;
+        self.clipboardToast = toast;
+        [self addSubview:toast];
+    }
+    self.clipboardToast.text = [NSString stringWithFormat:@"  Copied %lu chars  ", (unsigned long)length];
+    [self.clipboardToast sizeToFit];
+    self.clipboardToast.center = CGPointMake(CGRectGetMidX(self.bounds), CGRectGetMaxY(self.bounds) - 60);
+    // Cancel any in-flight fade so a rapid second copy stays visible.
+    [self.toastAnimator stopAnimation:YES];
+    self.toastAnimator = nil;
+    self.clipboardToast.alpha = 1;
+    self.clipboardToast.hidden = NO;
+    self.toastAnimator = [[UIViewPropertyAnimator alloc] initWithDuration:0.9 curve:UIViewAnimationCurveEaseIn animations:^{
+        self.clipboardToast.alpha = 0;
+    }];
+    [self.toastAnimator addCompletion:^(UIViewAnimatingPosition finalPosition) {
+        self.clipboardToast.hidden = YES;
+    }];
+    [self.toastAnimator startAnimationAfterDelay:0.8];
+}
+
+- (void)hidePasteMenu {
+    if (@available(iOS 16.0, *)) {
+        [self.pasteEditMenu dismissMenu];
+    } else {
+        [UIMenuController.sharedMenuController setMenuVisible:NO animated:YES];
+    }
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
+    return YES;
 }
 
 - (void)selectTerminalText:(UILongPressGestureRecognizer *)gesture {
     if (!self.terminal.loaded)
         return;
-    CGPoint point = [gesture locationInView:self.terminal.webView];
-    if (gesture.state == UIGestureRecognizerStateBegan || gesture.state == UIGestureRecognizerStateChanged) {
-        self.scrollbarView.scrollEnabled = NO;
-        NSString *method = gesture.state == UIGestureRecognizerStateBegan ? @"beginSelection" : @"extendSelection";
-        NSString *script = [NSString stringWithFormat:@"exports.%@(%f,%f)", method, point.x, point.y];
-        [self.terminal.webView evaluateJavaScript:script completionHandler:nil];
-    } else if (gesture.state == UIGestureRecognizerStateEnded) {
-        self.scrollbarView.scrollEnabled = YES;
-        [self becomeFirstResponder];
-        CGPoint anchor = [gesture locationInView:self];
-        if (@available(iOS 16.0, *)) {
-            [self.terminalEditMenu presentEditMenuWithConfiguration:[UIEditMenuConfiguration configurationWithIdentifier:nil sourcePoint:anchor]];
-        } else {
-            [UIMenuController.sharedMenuController showMenuFromView:self rect:CGRectMake(anchor.x, anchor.y, 1, 1)];
+    CGPoint pointInSelf = [gesture locationInView:self];
+    CGPoint pointInWebView = [gesture locationInView:self.terminal.webView];
+    if (gesture.state == UIGestureRecognizerStateBegan) {
+        // Hold still → paste popup. Move → selection drag. Decide by movement.
+        self.selectionDragMode = NO;
+        self.selectionGestureStart = pointInSelf;
+        self.longPressHoldTimer = [NSTimer scheduledTimerWithTimeInterval:0.35
+                                                                     target:self
+                                                                   selector:@selector(showPasteMenuFromTimer:)
+                                                                   userInfo:[NSValue valueWithCGPoint:pointInSelf]
+                                                                    repeats:NO];
+    } else if (gesture.state == UIGestureRecognizerStateChanged) {
+        if (!self.selectionDragMode) {
+            CGFloat moved = hypot(pointInSelf.x - self.selectionGestureStart.x, pointInSelf.y - self.selectionGestureStart.y);
+            if (moved < 15)
+                return; // still holding still; the paste timer keeps ticking
+            [self.longPressHoldTimer invalidate];
+            self.longPressHoldTimer = nil;
+            self.selectionDragMode = YES;
+            self.scrollbarView.scrollEnabled = NO;
+            [self.terminal.webView evaluateJavaScript:[NSString stringWithFormat:@"exports.beginSelection(%f,%f)", pointInWebView.x, pointInWebView.y] completionHandler:nil];
         }
-    } else if (gesture.state == UIGestureRecognizerStateCancelled || gesture.state == UIGestureRecognizerStateFailed) {
-        self.scrollbarView.scrollEnabled = YES;
+        [self loupeTrackGesturePoint:pointInWebView];
+        [self updateAutoscrollForPoint:pointInSelf endpoint:nil];
+        [self.terminal.webView evaluateJavaScript:[NSString stringWithFormat:@"exports.extendSelection(%f,%f)", pointInWebView.x, pointInWebView.y] completionHandler:nil];
+    } else if (gesture.state == UIGestureRecognizerStateEnded) {
+        [self.longPressHoldTimer invalidate];
+        self.longPressHoldTimer = nil;
+        [self hideSelectionLoupe];
+        [self stopAutoscroll];
+        if (self.selectionDragMode) {
+            self.scrollbarView.scrollEnabled = YES;
+            // Auto-copy is the copy UX: every settled selection copies.
+            [self copySelectionToPasteboard];
+        }
+        self.selectionDragMode = NO;
+    } else {
+        [self.longPressHoldTimer invalidate];
+        self.longPressHoldTimer = nil;
+        [self hideSelectionLoupe];
+        [self stopAutoscroll];
+        if (self.selectionDragMode)
+            self.scrollbarView.scrollEnabled = YES;
+        self.selectionDragMode = NO;
+    }
+}
+
+- (void)showPasteMenuFromTimer:(NSTimer *)timer {
+    self.longPressHoldTimer = nil;
+    self.selectionDragMode = NO;
+    CGPoint point = ((NSValue *)timer.userInfo).CGPointValue;
+    if (@available(iOS 16.0, *)) {
+        if (self.pasteEditMenu == nil) {
+            self.pasteEditMenu = [[UIEditMenuInteraction alloc] initWithDelegate:self];
+            [self addInteraction:self.pasteEditMenu];
+        }
+        [self.pasteEditMenu presentEditMenuWithConfiguration:[UIEditMenuConfiguration configurationWithIdentifier:nil sourcePoint:point]];
+    } else {
+        UIMenuController *menuController = UIMenuController.sharedMenuController;
+        UIMenuItem *pasteItem = [[UIMenuItem alloc] initWithTitle:@"Paste" action:@selector(paste:)];
+        [menuController setMenuItems:@[pasteItem]];
+        [menuController setTargetRect:CGRectMake(point.x, point.y, 1, 1) inView:self];
+        [menuController setMenuVisible:YES animated:YES];
     }
 }
 
 - (UIMenu *)editMenuInteraction:(UIEditMenuInteraction *)interaction menuForConfiguration:(UIEditMenuConfiguration *)configuration suggestedActions:(NSArray<UIMenuElement *> *)suggestedActions API_AVAILABLE(ios(16.0)) {
     __weak TerminalView *view = self;
-    UIAction *copy = [UIAction actionWithTitle:@"Copy" image:[UIImage systemImageNamed:@"doc.on.doc"] identifier:nil handler:^(UIAction *action) { [view copy:nil]; }];
-    UIAction *selectAll = [UIAction actionWithTitle:@"Select All" image:nil identifier:nil handler:^(UIAction *action) { [view selectAll:nil]; }];
-    return [UIMenu menuWithChildren:@[copy, selectAll]];
+    UIAction *paste = [UIAction actionWithTitle:@"Paste" image:[UIImage systemImageNamed:@"doc.on.clipboard"] identifier:nil handler:^(UIAction *action) {
+        [view paste:nil];
+    }];
+    return [UIMenu menuWithChildren:@[paste]];
 }
+
+// The edit menu interaction was removed: auto-copy on selection settle is
+// the copy UX, and Select All was never useful on a terminal.
+
 
 - (void)clearScrollback:(UIKeyCommand *)command {
     [self.terminal.webView evaluateJavaScript:@"exports.clearScrollback()" completionHandler:nil];
@@ -532,15 +890,19 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
 }
 
 - (void)updateFloatingCursorAtPoint:(CGPoint)point {
+    // UIKit can probe the floating cursor before a terminal is attached; a nil
+    // terminal here used to crash appendString: with a nil arrow sequence.
+    if (self.terminal == nil || self.terminal.webView == nil)
+        return;
     struct rowcol newPos = [self rowcolFromPoint:point];
     int rowDiff = newPos.row - self.floatingCursor.row;
     int colDiff = newPos.col - self.floatingCursor.col;
     NSMutableString *arrows = [NSMutableString string];
     for (int i = 0; i < abs(rowDiff); i++) {
-        [arrows appendString:[self.terminal arrow:rowDiff > 0 ? 'A': 'B']];
+        [arrows appendString:[self.terminal arrow:rowDiff > 0 ? 'A': 'B'] ?: @""];
     }
     for (int i = 0; i < abs(colDiff); i++) {
-        [arrows appendString:[self.terminal arrow:colDiff > 0 ? 'C': 'D']];
+        [arrows appendString:[self.terminal arrow:colDiff > 0 ? 'C': 'D'] ?: @""];
     }
     [self insertText:arrows];
     self.floatingCursor = newPos;

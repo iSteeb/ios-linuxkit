@@ -25,7 +25,8 @@
     CGRect frame = scrollView.contentView.frame;
     frame.origin.x = scrollView.contentOffset.x + scrollView.contentViewOrigin.x;
     frame.origin.y = scrollView.contentOffset.y + scrollView.contentViewOrigin.y;
-    scrollView.contentView.frame = frame;
+    if (!CGRectEqualToRect(frame, scrollView.contentView.frame))
+        scrollView.contentView.frame = frame;
     [self.innerDelegate scrollViewDidScroll:scrollView];
 }
 

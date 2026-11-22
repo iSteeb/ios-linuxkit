@@ -78,6 +78,17 @@ static NSString *kDefaultRoot = @"Default Root";
 }
 
 - (void)syncFileProviderDomains {
+    // The File Provider extension is not embedded in ARM64 builds; touching
+    // NSFileProviderManager without it only produces boot-time errors. Just
+    // try once to remove any stale domains, quietly.
+    NSString *extensionPath = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"PlugIns/iSHFileProvider.appex"];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:extensionPath]) {
+        [NSFileProviderManager getDomainsWithCompletionHandler:^(NSArray<NSFileProviderDomain *> *domains, NSError *error) {
+            for (NSFileProviderDomain *domain in domains)
+                [NSFileProviderManager removeDomain:domain completionHandler:nil];
+        }];
+        return;
+    }
     if (self.updatingDomains) {
         self.domainsNeedUpdate = YES;
         return;
