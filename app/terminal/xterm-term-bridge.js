@@ -96,6 +96,8 @@
     let oldProps = {};
     let xtermAppActive = null;
     let selectionAnchor = null;
+    let selectionEnd = null;
+    let lastNewOutputReport = 0;
 
     // ── Terminal setup ────────────────────────────────────────────────────────
     const term = new Terminal({
@@ -134,9 +136,43 @@
         native.resize();
         scheduleScrollSync();
     });
-    term.onScroll(scheduleScrollSync);
+    term.onScroll(() => {
+        scheduleScrollSync();
+        reportSelectionGeometry();
+    });
     term.onCursorMove(syncApplicationCursor);
-    term.onSelectionChange(() => native.selectionChanged(term.getSelection()));
+    term.onSelectionChange(() => {
+        reportSelectionGeometry();
+    });
+
+    // OSC 52: programs (local or over SSH, e.g. vim/tmux) yank to the clipboard
+    // with ESC ] 52 ; c ; <base64> ST. Decode and forward to the system clipboard.
+    const OSC52_MAX_BASE64 = 262144;
+    try {
+        term.parser.registerOscHandler(52, (data) => {
+            try {
+                // xterm delivers "c;<base64>" (strips the empty selection param);
+                // be liberal and also accept ";c;<base64>".
+                const parts = data.split(';');
+                const clipboard = parts[0] === '' ? parts[1] : parts[0];
+                const encoded = parts.slice(parts[0] === '' ? 2 : 1).join(';');
+                if (clipboard !== 'c' || !encoded || encoded === '?')
+                    return true;
+                if (encoded.length > OSC52_MAX_BASE64)
+                    return true;
+                const binary = atob(encoded);
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++)
+                    bytes[i] = binary.charCodeAt(i);
+                native.setClipboard(new TextDecoder().decode(bytes));
+            } catch (error) {
+                native.log(`osc52 failed: ${error?.stack || error}`);
+            }
+            return true;
+        });
+    } catch (error) {
+        native.log(`osc52 registration failed: ${error?.stack || error}`);
+    }
 
     term.open(terminalElement);
     installNativeFocusAdapter();
@@ -148,13 +184,34 @@
     scheduleScrollSync();
 
     // ── Resize handling ──────────────────────────────────────────────────────
+    let resizeDebounce = null;
+
     function fitTerminal() {
         if (resizeFrame !== null)
             return;
         resizeFrame = requestAnimationFrame(() => {
             resizeFrame = null;
+            const buffer = term.buffer.active;
+            // Preserve what the user is looking at across reflows (keyboard
+            // show/hide, font size changes, rotation): follow the newest line
+            // if we were at the bottom, otherwise keep the same top line.
+            const wasFollowing = buffer.viewportY >= buffer.baseY;
+            const previousTopLine = buffer.viewportY;
             fitAddon.fit();
-            native.resize();
+            const newBuffer = term.buffer.active;
+            if (wasFollowing) {
+                term.scrollToBottom();
+            } else if (previousTopLine > 0) {
+                term.scrollToLine(Math.min(previousTopLine, newBuffer.baseY));
+            }
+            // Keyboard animations refit every frame; notify the guest of its
+            // new window size only once things settle (one SIGWINCH, not 60).
+            if (resizeDebounce !== null)
+                clearTimeout(resizeDebounce);
+            resizeDebounce = setTimeout(() => {
+                resizeDebounce = null;
+                native.resize();
+            }, 150);
             scheduleScrollSync();
         });
     }
@@ -177,6 +234,7 @@
             term.write(bytes, scheduleScrollSync);
             if (bytes.includes(0x1b))
                 syncApplicationCursor();
+            maybeReportNewOutput();
         },
         getSize() {
             return [term.cols, term.rows];
@@ -186,20 +244,59 @@
         },
         beginSelection(x, y) {
             selectionAnchor = selectionCell(x, y);
-            if (selectionAnchor)
-                term.select(selectionAnchor.col, selectionAnchor.row, 1);
+            if (!selectionAnchor)
+                return;
+            // Long-press selects the word under the finger, like iOS text fields.
+            const word = wordRangeAt(selectionAnchor);
+            if (word) {
+                selectionAnchor = word.start;
+                selectionEnd = word.end;
+                selectRange(selectionAnchor, selectionEnd);
+            } else {
+                // Blank area: keep the anchor for drag-extend, but never create
+                // an empty selection (a zero-length selection is sticky and
+                // used to wedge the tap-to-focus handler).
+                selectionEnd = selectionAnchor;
+            }
         },
         extendSelection(x, y) {
             const end = selectionCell(x, y);
             if (!selectionAnchor || !end)
                 return;
-            const a = selectionAnchor.row * term.cols + selectionAnchor.col;
-            const b = end.row * term.cols + end.col;
-            const start = Math.min(a, b);
-            term.select(start % term.cols, Math.floor(start / term.cols), Math.abs(a - b) + 1);
+            selectionEnd = end;
+            selectRange(selectionAnchor, selectionEnd);
         },
-        selectAll() { term.selectAll(); },
-        clearSelection() { selectionAnchor = null; term.clearSelection(); },
+        moveSelectionEndpoint(which, x, y) {
+            // Move the VISUAL start or end endpoint, whichever side the anchor
+            // currently is. Handles may cross: dragging the start handle past
+            // the end naturally swaps their roles (native iOS behavior).
+            const cell = selectionCell(x, y);
+            if (!cell || !selectionAnchor || !selectionEnd)
+                return;
+            const anchorIsVisualStart = cellLess(selectionAnchor, selectionEnd);
+            if (which === 'start') {
+                if (anchorIsVisualStart)
+                    selectionAnchor = cell;
+                else
+                    selectionEnd = cell;
+            } else {
+                if (anchorIsVisualStart)
+                    selectionEnd = cell;
+                else
+                    selectionAnchor = cell;
+            }
+            selectRange(selectionAnchor, selectionEnd);
+        },
+        selectAll() {
+            selectionAnchor = {row: 0, col: 0};
+            selectionEnd = {row: term.buffer.active.length - 1, col: term.cols - 1};
+            term.selectAll();
+        },
+        clearSelection() {
+            selectionAnchor = null;
+            selectionEnd = null;
+            term.clearSelection();
+        },
         setFocused(focused) {
             terminalElement.classList.toggle('terminal-focused', !!focused);
             setXtermAppActive(!!focused);
@@ -250,6 +347,12 @@
         },
         setUserGesture() {},
         setAccessibilityEnabled() {},
+        updateLoupe(x, y) {
+            updateLoupe(x, y);
+        },
+        hideLoupe() {
+            hideLoupe();
+        },
     };
 
     // ── Signal ready ─────────────────────────────────────────────────────────
@@ -267,6 +370,11 @@
         term.textarea.autocomplete = 'off';
         term.textarea.autocorrect = 'off';
         term.textarea.spellcheck = false;
+        // Never let taps reach the hidden textarea: it used to steal first
+        // responder from the native terminal view, closing the keyboard on a
+        // single tap and breaking the double-tap toggle.
+        term.textarea.style.pointerEvents = 'none';
+        term.textarea.setAttribute('aria-hidden', 'true');
     }
 
     function selectionCell(x, y) {
@@ -281,22 +389,146 @@
         };
     }
 
+    function cellLess(a, b) {
+        return a.row * term.cols + a.col < b.row * term.cols + b.col;
+    }
+
+    function selectRange(a, b) {
+        const start = cellLess(a, b) ? a : b;
+        const end = cellLess(a, b) ? b : a;
+        const distance = (end.row * term.cols + end.col) - (start.row * term.cols + start.col);
+        term.select(start.col, start.row, distance + 1);
+    }
+
+    function wordRangeAt(cell) {
+        const buffer = term.buffer.active;
+        const row = Math.max(0, Math.min(cell.row, buffer.length - 1));
+        const line = buffer.getLine(row);
+        if (!line)
+            return null;
+        const text = line.translateToString(false);
+        const isWord = (ch) => ch !== undefined && /\S/.test(ch);
+        if (!isWord(text[cell.col]))
+            return null;
+        let startCol = cell.col;
+        let endCol = cell.col;
+        while (startCol > 0 && isWord(text[startCol - 1]))
+            startCol--;
+        while (isWord(text[endCol + 1]))
+            endCol++;
+        return {start: {row: cell.row, col: startCol}, end: {row: cell.row, col: endCol}};
+    }
+
+    function reportSelectionGeometry() {
+        if (!selectionAnchor || !selectionEnd || !term.hasSelection()) {
+            native.selectionRect(null);
+            return;
+        }
+        const screen = terminalElement.querySelector('.xterm-screen');
+        const cell = getCellSize();
+        if (!screen || !cell.width || !cell.height)
+            return;
+        const rect = screen.getBoundingClientRect();
+        const viewportY = term.buffer.active.viewportY;
+        const pointFor = (c) => ({
+            x: rect.left + c.col * cell.width,
+            y: rect.top + (c.row - viewportY) * cell.height,
+        });
+        const start = cellLess(selectionAnchor, selectionEnd) ? selectionAnchor : selectionEnd;
+        const end = cellLess(selectionAnchor, selectionEnd) ? selectionEnd : selectionAnchor;
+        const startPoint = pointFor(start);
+        const endPoint = pointFor(end);
+        native.selectionRect({
+            sx: startPoint.x,
+            sy: startPoint.y,
+            ex: endPoint.x + cell.width,
+            ey: endPoint.y,
+            cellHeight: cell.height,
+        });
+    }
+
+    function maybeReportNewOutput() {
+        const buffer = term.buffer.active;
+        if (buffer.viewportY >= buffer.baseY)
+            return; // following the latest line: nothing to surface
+        const now = performance.now();
+        if (now - lastNewOutputReport < 250)
+            return;
+        lastNewOutputReport = now;
+        native.newOutput(true);
+    }
+
+    // ── In-page selection loupe ─────────────────────────────────────────────
+    // Magnifies the terminal's own canvases synchronously (canvas-to-canvas).
+    // Native snapshot APIs deliver too late during gesture tracking; the page
+    // provably renders live during drags (the selection highlight does).
+    let loupeRoot = null;
+    let loupeCanvas = null;
+
+    function updateLoupe(x, y) {
+        if (!loupeRoot) {
+            loupeRoot = document.createElement('div');
+            const d = 120;
+            loupeRoot.style.cssText = `position:fixed;left:0;top:0;width:${d}px;height:${d}px;` +
+                'border-radius:60px;border:3px solid rgba(25,25,25,0.8);box-shadow:0 4px 12px rgba(0,0,0,0.35);' +
+                'overflow:hidden;pointer-events:none;z-index:9999;display:none;';
+            const dpr = window.devicePixelRatio || 1;
+            loupeCanvas = document.createElement('canvas');
+            loupeCanvas.width = d * dpr;
+            loupeCanvas.height = d * dpr;
+            loupeCanvas.style.cssText = 'width:120px;height:120px;display:block;';
+            loupeRoot.appendChild(loupeCanvas);
+            document.body.appendChild(loupeRoot);
+        }
+        const dpr = window.devicePixelRatio || 1;
+        const diameter = 120;
+        const magnification = 2;
+        const region = diameter / magnification; // 60 CSS px of terminal
+        const sourceX = Math.max(0, Math.min(window.innerWidth - region, x - region / 2));
+        const sourceY = Math.max(0, Math.min(window.innerHeight - region, y - region / 2));
+        const context = loupeCanvas.getContext('2d');
+        context.setTransform(dpr, 0, 0, dpr, 0, 0);
+        context.clearRect(0, 0, diameter, diameter);
+        const canvases = terminalElement.querySelectorAll('canvas');
+        for (const canvas of canvases) {
+            const rect = canvas.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0)
+                continue;
+            // Source rect in the canvas's internal pixel space.
+            const kx = canvas.width / rect.width;
+            const ky = canvas.height / rect.height;
+            const sx = (sourceX - rect.left) * kx;
+            const sy = (sourceY - rect.top) * ky;
+            try {
+                context.drawImage(canvas, sx, sy, region * kx, region * ky, 0, 0, diameter, diameter);
+            } catch (error) {
+                // tainted or missing layer; skip
+            }
+        }
+        loupeRoot.style.display = 'block';
+        let left = x - diameter / 2;
+        let top = y - diameter - 46;
+        left = Math.max(4, Math.min(window.innerWidth - diameter - 4, left));
+        top = Math.max(4, top);
+        loupeRoot.style.left = `${left}px`;
+        loupeRoot.style.top = `${top}px`;
+    }
+
+    function hideLoupe() {
+        if (loupeRoot)
+            loupeRoot.style.display = 'none';
+    }
+
     function installFocusBridge() {
-        terminalElement.addEventListener('touchstart', (event) => {
-            if (!term.hasSelection())
-                event.preventDefault();
-        }, {capture: true});
-        terminalElement.addEventListener('touchend', (event) => {
-            if (term.hasSelection())
-                term.clearSelection();
-            event.preventDefault();
-            event.stopImmediatePropagation();
-            native.focus();
-        }, {capture: true});
-        terminalElement.addEventListener('mousedown', (event) => {
-            event.preventDefault();
-            if (!term.hasSelection())
-                native.focus();
+        // Native owns every touch: pan scrolls, double tap toggles the
+        // keyboard, long-press selects or pastes. The page opts out of web
+        // touch handling entirely: `touch-action: none` stops default web
+        // scrolling, and a capture-phase stopPropagation keeps xterm's own
+        // viewport touch handlers from seeing drags. Nothing here ever calls
+        // preventDefault (that kills native ancestor recognizers) or focuses.
+        terminalElement.style.touchAction = 'none';
+        terminalElement.addEventListener('touchmove', (event) => {
+            event.stopPropagation();
         }, {capture: true});
         terminalElement.addEventListener('focus', () => native.syncFocus());
         terminalElement.addEventListener('blur', () => native.syncFocus());
@@ -477,8 +709,8 @@
             background: style.backgroundColor,
             cursor: style.cursorColor || style.foregroundColor,
             cursorAccent: style.backgroundColor,
-            selectionBackground: style.foregroundColor,
-            selectionForeground: style.backgroundColor,
+            // Translucent tint keeps the underlying text visible while selected.
+            selectionBackground: 'rgba(120, 170, 255, 0.35)',
         };
         if (Array.isArray(style.colorPaletteOverrides)) {
             for (let i = 0; i < Math.min(ansiColorNames.length, style.colorPaletteOverrides.length); i++)

@@ -88,6 +88,12 @@ body {
     overflow: hidden;
 }
 
+#terminal .xterm .xterm-scrollable-element > .scrollbar {
+    /* Native owns scrolling; xterm's built-in overlay scrubber would be a
+       second, web-side scrollbar. */
+    display: none !important;
+}
+
 #terminal .xterm .xterm-viewport::-webkit-scrollbar {
     width: 0;
     height: 0;
