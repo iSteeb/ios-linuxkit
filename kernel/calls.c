@@ -2,9 +2,12 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/uio.h>
 #include <time.h>
 #include "debug.h"
 #include "kernel/calls.h"
+#include "kernel/time.h"
 #include "emu/interrupt.h"
 #include "kernel/memory.h"
 #include "kernel/signal.h"
@@ -39,6 +42,10 @@ void dump_maps(void);
 static inline int fast_fstat64(struct cpu_state *cpu);
 static inline int fast_read(struct cpu_state *cpu);
 static inline int fast_write(struct cpu_state *cpu);
+static inline int fast_clock_gettime(struct cpu_state *cpu, bool *recorded);
+static inline int fast_gettimeofday(struct cpu_state *cpu, bool *recorded);
+static inline int fast_readv(struct cpu_state *cpu);
+static inline int fast_writev(struct cpu_state *cpu);
 
 // Diagnostic: JIT crash info from signal handler
 __thread volatile uint64_t jit_last_host_fault = 0;
@@ -67,22 +74,52 @@ void handle_interrupt(int interrupt) {
         // === FAST PATH: Hot syscalls ===
         int fast_result = -1;  // -1 means fast path not taken
         bool fast_path_taken = false;
+        // Set when a fast path already refreshed the deadlock-detection
+        // progress timestamp from a clock value it had to read anyway, so
+        // the post-syscall bookkeeping below can skip its host clock read.
+        bool fast_progress_recorded = false;
 
-        // Fast path 1: fstat64 (syscall 80) - most common during Python import
-        if (syscall_num == 80) {
+        // Fast path 1: clock_gettime (syscall 113) - timers in every runtime
+        // (Go nanotime, V8 hrtime, Python perf_counter, bash EPOCHREALTIME)
+        if (syscall_num == 113) {
+            fast_result = fast_clock_gettime(cpu, &fast_progress_recorded);
+            if (fast_result != -1)
+                fast_path_taken = true;
+        }
+        // Fast path 2: gettimeofday (syscall 169) - bash EPOCHREALTIME etc.
+        else if (syscall_num == 169) {
+            fast_result = fast_gettimeofday(cpu, &fast_progress_recorded);
+            if (fast_result != -1)
+                fast_path_taken = true;
+        }
+        // Fast path 3: fstat64 (syscall 80) - most common during Python import
+        else if (syscall_num == 80) {
             fast_result = fast_fstat64(cpu);
             if (fast_result != -1)
                 fast_path_taken = true;
         }
-        // Fast path 2: read (syscall 63) - small buffer reads
+        // Fast path 4: read (syscall 63) - small buffer reads
         else if (syscall_num == 63) {
             fast_result = fast_read(cpu);
             if (fast_result != -1)
                 fast_path_taken = true;
         }
-        // Fast path 3: write (syscall 64) - small buffer writes
+        // Fast path 5: write (syscall 64) - small buffer writes
         else if (syscall_num == 64) {
             fast_result = fast_write(cpu);
+            if (fast_result != -1)
+                fast_path_taken = true;
+        }
+        // Fast path 6: readv (syscall 65) - small scatter reads
+        else if (syscall_num == 65) {
+            fast_result = fast_readv(cpu);
+            if (fast_result != -1)
+                fast_path_taken = true;
+        }
+        // Fast path 7: writev (syscall 66) - gather writes (libv, glibc/Rust
+        // stdio flush, Go net)
+        else if (syscall_num == 66) {
+            fast_result = fast_writev(cpu);
             if (fast_result != -1)
                 fast_path_taken = true;
         }
@@ -210,14 +247,23 @@ void handle_interrupt(int interrupt) {
         if (current->exiting || current->group == NULL) {
             pthread_exit(NULL);
         }
-        // Update deadlock detection state.
-        atomic_fetch_add(&current->group->syscall_count, 1);
+        // Update deadlock detection state. The counter still counts every
+        // syscall, but the progress *timestamp* — read only by the 60 s poll
+        // safety valve — is refreshed at most once every 64 syscalls so hot
+        // loops don't pay a host clock_gettime per syscall. A group must
+        // average ≥ 64 non-blocking syscalls per minute to keep the valve
+        // suppressed; anything sparser is functionally idle, which is the
+        // state the valve exists to reap. Fast clock_gettime/gettimeofday
+        // paths already recorded their timestamp from the value returned.
+        unsigned long prev_syscalls = atomic_fetch_add(&current->group->syscall_count, 1);
         // Update last_unblocked_ns for non-blocking syscalls only.
         // Blocking calls (futex, epoll, ppoll, waitid, nanosleep) that
         // return and retry should NOT refresh the timestamp, as they
         // don't represent real forward progress.
-        if (syscall_num != 22 && syscall_num != 73 && syscall_num != 95 &&
-            syscall_num != 98 && syscall_num != 101) {
+        if (!fast_progress_recorded &&
+                syscall_num != 22 && syscall_num != 73 && syscall_num != 95 &&
+                syscall_num != 98 && syscall_num != 101 &&
+                (prev_syscalls & 63) == 0) {
             struct timespec _ts;
             clock_gettime(CLOCK_MONOTONIC, &_ts);
             uint64_t now = (uint64_t)_ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
@@ -893,6 +939,266 @@ static inline int fast_write(struct cpu_state *cpu) {
     ssize_t res;
     do {
         res = write(fd->real_fd, buf, size);
+    } while (res < 0 && errno == EINTR);
+
+    if (res < 0)
+        return errno_map();
+
+    return res;
+}
+
+// Fast path for clock_gettime (syscall 113): the common monotonic/realtime
+// clocks only (same mapping as clockid_to_real); CPU-time clocks fall back to
+// the slow path. The timestamp we must read anyway also refreshes the
+// deadlock-detection progress state, so the post-syscall bookkeeping skips
+// its second host clock read.
+static inline int fast_clock_gettime(struct cpu_state *cpu, bool *recorded) {
+    dword_t clock = (dword_t)cpu->regs[0];
+    addr_t tp = (addr_t)cpu->regs[1];
+
+    clockid_t host_clock;
+    switch (clock) {
+        case CLOCK_REALTIME_:
+        case CLOCK_REALTIME_COARSE_:
+            host_clock = CLOCK_REALTIME; break;
+        case CLOCK_MONOTONIC_:
+        case CLOCK_MONOTONIC_RAW_:
+        case CLOCK_MONOTONIC_COARSE_:
+        case CLOCK_BOOTTIME_:
+            host_clock = CLOCK_MONOTONIC; break;
+        default:
+            return -1;  // PROCESS_CPUTIME_ID & friends: slow path
+    }
+    if (tp == 0)
+        return -1;  // slow path turns a NULL tp into EFAULT
+
+    struct timespec ts;
+    if (clock_gettime(host_clock, &ts) < 0)
+        return errno_map();
+
+    struct timespec_ t;
+    t.sec = ts.tv_sec;
+    t.nsec = ts.tv_nsec;
+    if (user_put(tp, t))
+        return _EFAULT;
+
+    if (!current->exiting && current->group != NULL) {
+        uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+        current->last_unblocked_ns = now;
+        atomic_store_explicit(&current->group->last_progress_ns, now,
+                              memory_order_relaxed);
+        *recorded = true;
+    }
+    return 0;
+}
+
+// Fast path for gettimeofday (syscall 169) when no timezone is requested
+// (musl/glibc/bash all pass tz=NULL).
+static inline int fast_gettimeofday(struct cpu_state *cpu, bool *recorded) {
+    addr_t tv_addr = (addr_t)cpu->regs[0];
+    addr_t tz_addr = (addr_t)cpu->regs[1];
+    if (tz_addr != 0)
+        return -1;  // timezone fetch: slow path
+
+    struct timeval tv;
+    if (gettimeofday(&tv, NULL) < 0)
+        return errno_map();
+
+    if (tv_addr != 0) {
+        struct timeval_ t;
+        t.sec = tv.tv_sec;
+        t.usec = tv.tv_usec;
+        if (user_put(tv_addr, t))
+            return _EFAULT;
+    }
+
+    if (!current->exiting && current->group != NULL) {
+        uint64_t now = (uint64_t)tv.tv_sec * 1000000000ULL + tv.tv_usec * 1000ULL;
+        current->last_unblocked_ns = now;
+        atomic_store_explicit(&current->group->last_progress_ns, now,
+                              memory_order_relaxed);
+        *recorded = true;
+    }
+    return 0;
+}
+
+// Vector fast paths. The slow paths (kernel/fs.c sys_readv/sys_writev)
+// malloc an iovec64 array, convert it to a second 32-bit iovec array, malloc
+// a flat buffer, and copy every byte twice. These paths keep the same
+// external semantics (return value, EFAULT/EBADF/EINTR handling) with stack
+// buffers and, for regular files, no data copy at all.
+//
+// Lock discipline: mem->lock is never held across a host call that can block
+// indefinitely on a peer (pipes/sockets can fill, tty has backpressure),
+// because a guest sibling blocked on mmap/brk (write lock) while we wait for
+// a reader that needs our own progress would deadlock. Regular files can
+// only block on the host page cache, never on a guest-dependent peer, so
+// they get the zero-copy variant with the read lock held across host writev.
+#define FAST_IOV_MAX (32 * 1024)
+#define FAST_IOV_ENTRIES 8
+
+struct fast_iov {
+    struct iovec64_ iov[FAST_IOV_ENTRIES];
+    dword_t count;
+    size_t total;
+};
+
+// Reads and validates a small guest iovec array. Returns false to fall back
+// to the slow path (which produces the precise errno for bad addresses).
+static inline bool fast_read_iov(addr_t iovec_addr, dword_t iovec_count,
+                                 struct fast_iov *f) {
+    if (iovec_count < 1 || iovec_count > FAST_IOV_ENTRIES)
+        return false;
+    if (user_read(iovec_addr, f->iov, sizeof(f->iov[0]) * iovec_count))
+        return false;
+    size_t total = 0;
+    for (dword_t i = 0; i < iovec_count; i++) {
+        if (f->iov[i].len > FAST_IOV_MAX)
+            return false;
+        total += f->iov[i].len;
+        if (total > FAST_IOV_MAX)
+            return false;
+    }
+    f->count = iovec_count;
+    f->total = total;
+    return true;
+}
+
+// Builds a host iovec array from guest fragments, splitting at guest page
+// boundaries. Returns false if any fragment is unmapped (caller falls back;
+// nothing has been transferred yet). Called with mem->lock held for read.
+static inline bool fast_iov_to_host(struct mem *mem, const struct fast_iov *f,
+                                    int prot, struct iovec *hiov, unsigned *nh) {
+    unsigned n = 0;
+    for (dword_t i = 0; i < f->count; i++) {
+        addr_t base = f->iov[i].base;
+        size_t len = f->iov[i].len;
+        while (len > 0) {
+            addr_t chunk_end = (PAGE(base) + 1) << PAGE_BITS;
+            if (chunk_end > base + len)
+                chunk_end = base + len;
+            char *ptr = mem_ptr(mem, base, prot);
+            if (ptr == NULL)
+                return false;
+            hiov[n].iov_base = ptr;
+            hiov[n].iov_len = chunk_end - base;
+            n++;
+            len -= chunk_end - base;
+            base = chunk_end;
+        }
+    }
+    *nh = n;
+    return true;
+}
+
+// Fast path for readv (syscall 65): ≤ 8 iovs totaling ≤ 32 KB on realfs fds.
+static inline int fast_readv(struct cpu_state *cpu) {
+    fd_t fd_no = (fd_t)cpu->regs[0];
+    struct fd *fd = f_get(fd_no);
+    if (fd == NULL || fd->ops != &realfs_fdops)
+        return -1;
+
+    struct fast_iov f;
+    if (!fast_read_iov((addr_t)cpu->regs[1], (dword_t)cpu->regs[2], &f))
+        return -1;
+    if (f.total == 0)
+        return 0;
+
+    if (S_ISREG(fd->type)) {
+        // Zero-copy: host readv directly into guest pages.
+        struct iovec hiov[FAST_IOV_ENTRIES * (FAST_IOV_MAX / 4096 + 1)];
+        unsigned nh;
+        struct mem *mem = __atomic_load_n(&current->mem, __ATOMIC_ACQUIRE);
+        if (mem == NULL)
+            return -1;
+        read_wrlock(&mem->lock);
+        if (!fast_iov_to_host(mem, &f, MEM_WRITE, hiov, &nh)) {
+            read_wrunlock(&mem->lock);
+            return -1;
+        }
+        ssize_t res;
+        do {
+            res = readv(fd->real_fd, hiov, nh);
+        } while (res < 0 && errno == EINTR);
+        read_wrunlock(&mem->lock);
+        if (res < 0)
+            return errno_map();
+        return res;
+    }
+
+    // Gathered: host read into a stack buffer with no lock held (pipes and
+    // other fds can block waiting for a writer), then scatter under per-iov
+    // user_write locks.
+    char buf[FAST_IOV_MAX];
+    ssize_t res;
+    do {
+        if (current->group->doing_group_exit)
+            return _EINTR;
+        res = read(fd->real_fd, buf, f.total);
+    } while (res < 0 && errno == EINTR && !syscall_should_surface_eintr());
+    if (res < 0)
+        return errno_map();
+
+    size_t remaining = res;
+    size_t offset = 0;
+    for (dword_t i = 0; i < f.count && remaining > 0; i++) {
+        size_t n = f.iov[i].len < remaining ? f.iov[i].len : remaining;
+        if (n > 0 && user_write(f.iov[i].base, buf + offset, n))
+            return _EFAULT;
+        remaining -= n;
+        offset += f.iov[i].len;
+    }
+    return res;
+}
+
+// Fast path for writev (syscall 66): ≤ 8 iovs totaling ≤ 32 KB on realfs fds.
+static inline int fast_writev(struct cpu_state *cpu) {
+    fd_t fd_no = (fd_t)cpu->regs[0];
+    struct fd *fd = f_get(fd_no);
+    if (fd == NULL || fd->ops != &realfs_fdops)
+        return -1;
+
+    struct fast_iov f;
+    if (!fast_read_iov((addr_t)cpu->regs[1], (dword_t)cpu->regs[2], &f))
+        return -1;
+    if (f.total == 0)
+        return 0;
+
+    if (S_ISREG(fd->type)) {
+        // Zero-copy: host writev straight from guest pages.
+        struct iovec hiov[FAST_IOV_ENTRIES * (FAST_IOV_MAX / 4096 + 1)];
+        unsigned nh;
+        struct mem *mem = __atomic_load_n(&current->mem, __ATOMIC_ACQUIRE);
+        if (mem == NULL)
+            return -1;
+        read_wrlock(&mem->lock);
+        if (!fast_iov_to_host(mem, &f, MEM_READ, hiov, &nh)) {
+            read_wrunlock(&mem->lock);
+            return -1;
+        }
+        ssize_t res;
+        do {
+            res = writev(fd->real_fd, hiov, nh);
+        } while (res < 0 && errno == EINTR);
+        read_wrunlock(&mem->lock);
+        if (res < 0)
+            return errno_map();
+        return res;
+    }
+
+    // Gathered: copy guest fragments to a stack buffer (per-iov user_read
+    // locks), then one host write with no lock held.
+    char buf[FAST_IOV_MAX];
+    size_t offset = 0;
+    for (dword_t i = 0; i < f.count; i++) {
+        if (f.iov[i].len > 0 && user_read(f.iov[i].base, buf + offset, f.iov[i].len))
+            return _EFAULT;
+        offset += f.iov[i].len;
+    }
+
+    ssize_t res;
+    do {
+        res = write(fd->real_fd, buf, f.total);
     } while (res < 0 && errno == EINTR);
 
     if (res < 0)

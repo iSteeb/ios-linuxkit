@@ -386,6 +386,49 @@ static struct iovec_ *read_iovec(addr_t iovec_addr, unsigned iovec_count) {
 #endif
 }
 
+// Small-vector variant used by sys_readv/sys_writev: converts the guest
+// iovec array directly into the caller's stack storage (no allocation, no
+// intermediate 64-bit array). Larger/unusual requests fall back and are
+// told apart by a NULL *stack_used.
+#define GENERIC_IOV_MAX 16
+#define GENERIC_IOV_BYTES (32 * 1024)
+static int read_iovec_stack(addr_t iovec_addr, unsigned iovec_count,
+                             struct iovec_ stack_iov[GENERIC_IOV_MAX],
+                             struct iovec_ **iovec_out, bool *stack_used) {
+    *stack_used = false;
+    if (iovec_count >= 1 && iovec_count <= GENERIC_IOV_MAX) {
+        struct iovec64_ iov64[GENERIC_IOV_MAX];
+        if (user_read(iovec_addr, iov64, sizeof(iov64[0]) * iovec_count))
+            return _EFAULT;
+        size_t total = 0;
+        for (unsigned i = 0; i < iovec_count; i++) {
+            stack_iov[i].base = (addr_t)iov64[i].base;
+            stack_iov[i].len = (uint_t)iov64[i].len;
+            if (stack_iov[i].len > GENERIC_IOV_BYTES)
+                goto fallback;
+            total += stack_iov[i].len;
+            if (total > GENERIC_IOV_BYTES)
+                goto fallback;
+        }
+        *iovec_out = stack_iov;
+        *stack_used = true;
+        return 0;
+    }
+fallback:
+    {
+        struct iovec_ *iovec = read_iovec(iovec_addr, iovec_count);
+        if (IS_ERR(iovec))
+            return PTR_ERR(iovec);
+        *iovec_out = iovec;
+        return 0;
+    }
+}
+
+static void free_iovec(struct iovec_ *iovec, bool stack_used) {
+    if (!stack_used)
+        free(iovec);
+}
+
 static ssize_t iovec_size(struct iovec_ *iovec, unsigned iovec_count) {
     size_t size = 0;
     for (unsigned i = 0; i < iovec_count; i++)
@@ -395,13 +438,17 @@ static ssize_t iovec_size(struct iovec_ *iovec, unsigned iovec_count) {
 
 dword_t sys_readv(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count) {
     STRACE("readv(%d, %#x, %d)", fd_no, iovec_addr, iovec_count);
-    struct iovec_ *iovec = read_iovec(iovec_addr, iovec_count);
-    if (IS_ERR(iovec))
-        return PTR_ERR(iovec);
+    struct iovec_ stack_iov[GENERIC_IOV_MAX];
+    struct iovec_ *iovec;
+    bool iovec_on_stack;
+    int iov_err = read_iovec_stack(iovec_addr, iovec_count, stack_iov, &iovec, &iovec_on_stack);
+    if (iov_err != 0)
+        return iov_err;
     size_t io_size = iovec_size(iovec, iovec_count);
-    char *buf = malloc(io_size);
+    char stack_buf[GENERIC_IOV_BYTES];
+    char *buf = io_size <= sizeof(stack_buf) ? stack_buf : malloc(io_size);
     if (buf == NULL) {
-        free(iovec);
+        free_iovec(iovec, iovec_on_stack);
         return _ENOMEM;
     }
     ssize_t res = sys_read_buf(fd_no, buf, io_size);
@@ -422,39 +469,43 @@ dword_t sys_readv(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count) {
     }
 
 error:
-    free(buf);
-    free(iovec);
+    if (buf != stack_buf)
+        free(buf);
+    free_iovec(iovec, iovec_on_stack);
     return res;
 }
 
 static dword_t read_iovec_to_buf(addr_t iovec_addr, dword_t iovec_count,
                                   struct iovec_ **iovec_out, char **buf_out,
-                                  size_t *size_out) {
-    struct iovec_ *iovec = read_iovec(iovec_addr, iovec_count);
-    if (IS_ERR(iovec))
-        return PTR_ERR(iovec);
-    size_t io_size = iovec_size(iovec, iovec_count);
-    char *buf = malloc(io_size ? io_size : 1);
+                                  size_t *size_out, bool *iovec_on_stack,
+                                  char *stack_buf, size_t stack_buf_size,
+                                  struct iovec_ stack_iov[GENERIC_IOV_MAX]) {
+    int err = read_iovec_stack(iovec_addr, iovec_count, stack_iov, iovec_out,
+                               iovec_on_stack);
+    if (err != 0)
+        return err;
+    size_t io_size = iovec_size(*iovec_out, iovec_count);
+    char *buf = io_size <= stack_buf_size ? stack_buf : malloc(io_size ? io_size : 1);
     if (buf == NULL) {
-        free(iovec);
+        free_iovec(*iovec_out, *iovec_on_stack);
         return _ENOMEM;
     }
 
     size_t offset = 0;
     for (unsigned i = 0; i < iovec_count; i++) {
-        if (user_read(iovec[i].base, buf + offset, iovec[i].len)) {
-            free(buf);
-            free(iovec);
+        if (user_read((*iovec_out)[i].base, buf + offset, (*iovec_out)[i].len)) {
+            if (buf != stack_buf)
+                free(buf);
+            free_iovec(*iovec_out, *iovec_on_stack);
             return _EFAULT;
         }
 
-        size_t print_size = iovec[i].len;
+        size_t print_size = (*iovec_out)[i].len;
         if (print_size > 100) print_size = 100;
-        STRACE(" {\"%.*s\", %u}", print_size, buf + offset, iovec[i].len);
-        offset += iovec[i].len;
+        STRACE(" {\"%.*s\", %u}", print_size, buf + offset, (*iovec_out)[i].len);
+        offset += (*iovec_out)[i].len;
     }
 
-    *iovec_out = iovec;
     *buf_out = buf;
     *size_out = io_size;
     return 0;
@@ -462,16 +513,22 @@ static dword_t read_iovec_to_buf(addr_t iovec_addr, dword_t iovec_count,
 
 dword_t sys_writev(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count) {
     STRACE("writev(%d, %#x, %d)", fd_no, iovec_addr, iovec_count);
+    struct iovec_ stack_iov[GENERIC_IOV_MAX];
+    char stack_buf[GENERIC_IOV_BYTES];
     struct iovec_ *iovec;
     char *buf;
     size_t io_size;
-    dword_t err = read_iovec_to_buf(iovec_addr, iovec_count, &iovec, &buf, &io_size);
+    bool iovec_on_stack;
+    dword_t err = read_iovec_to_buf(iovec_addr, iovec_count, &iovec, &buf,
+                                    &io_size, &iovec_on_stack, stack_buf,
+                                    sizeof(stack_buf), stack_iov);
     if (err != 0)
         return err;
 
     ssize_t res = sys_write_buf(fd_no, buf, io_size);
-    free(buf);
-    free(iovec);
+    if (buf != stack_buf)
+        free(buf);
+    free_iovec(iovec, iovec_on_stack);
     return res;
 }
 
@@ -630,10 +687,15 @@ dword_t sys_pwritev(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count, off_t_ o
     if (fd == NULL)
         return _EBADF;
 
+    struct iovec_ stack_iov[GENERIC_IOV_MAX];
+    char stack_buf[GENERIC_IOV_BYTES];
     struct iovec_ *iovec;
     char *buf;
     size_t io_size;
-    dword_t err = read_iovec_to_buf(iovec_addr, iovec_count, &iovec, &buf, &io_size);
+    bool iovec_on_stack;
+    dword_t err = read_iovec_to_buf(iovec_addr, iovec_count, &iovec, &buf,
+                                    &io_size, &iovec_on_stack, stack_buf,
+                                    sizeof(stack_buf), stack_iov);
     if (err != 0)
         return err;
 
@@ -641,8 +703,9 @@ dword_t sys_pwritev(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count, off_t_ o
     ssize_t res = fd_pwrite_buf(fd, buf, io_size, off);
     unlock(&fd->lock);
 
-    free(buf);
-    free(iovec);
+    if (buf != stack_buf)
+        free(buf);
+    free_iovec(iovec, iovec_on_stack);
     return res;
 }
 

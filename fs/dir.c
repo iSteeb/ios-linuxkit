@@ -81,6 +81,15 @@ int_t sys_getdents_common(fd_t f, addr_t dirents, dword_t count,
 
     dword_t orig_count = count;
 
+    // Batch dirents into a bounce buffer flushed to guest memory as rarely as
+    // possible: every user_write takes the mm read lock, so per-entry writes
+    // dominated large directory listings (ls -R, apk, cargo registry scans).
+    size_t bounce_cap = orig_count < 65536 ? orig_count : 65536;
+    char *bounce = malloc(bounce_cap);
+    if (bounce == NULL)
+        return _ENOMEM;
+    size_t bounce_len = 0;
+
     long ptr;
     int err;
     int printed = 0;
@@ -88,8 +97,10 @@ int_t sys_getdents_common(fd_t f, addr_t dirents, dword_t count,
         ptr = fd_telldir(fd);
         struct dir_entry entry = {0};
         err = fd->ops->readdir(fd, &entry);
-        if (err < 0)
+        if (err < 0) {
+            free(bounce);
             return err;
+        }
         if (err == 0)
             break;
 
@@ -112,11 +123,37 @@ int_t sys_getdents_common(fd_t f, addr_t dirents, dword_t count,
         fprintf(stderr, "getdents: returning entry: name='%s' inode=%lu off=%lu reclen=%zu at addr=%#llx\n",
                 name, (unsigned long)inode, (unsigned long)offset, reclen, (unsigned long long)dirents);
 #endif
-        if (user_write(dirents, dirent_data, reclen))
-            return _EFAULT;
-        dirents += reclen;
+        // reclen ≤ count ≤ orig_count; bounce_cap ≥ any single reclen seen
+        // with 255-byte names, but stay correct for any size: oversized
+        // entries bypass the bounce buffer with a direct write.
+        if (reclen > bounce_cap) {
+            if (user_write(dirents, dirent_data, reclen)) {
+                free(bounce);
+                return _EFAULT;
+            }
+            dirents += reclen;
+            count -= reclen;
+            continue;
+        }
+        // Flush when this entry wouldn't fit the remaining bounce space.
+        if (reclen > bounce_cap - bounce_len) {
+            if (user_write(dirents, bounce, bounce_len)) {
+                free(bounce);
+                return _EFAULT;
+            }
+            dirents += bounce_len;
+            bounce_len = 0;
+        }
+        memcpy(bounce + bounce_len, dirent_data, reclen);
+        bounce_len += reclen;
         count -= reclen;
     }
+
+    if (bounce_len > 0 && user_write(dirents, bounce, bounce_len)) {
+        free(bounce);
+        return _EFAULT;
+    }
+    free(bounce);
 
     fd_seekdir(fd, ptr);
 #if DENTS_DEBUG
