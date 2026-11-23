@@ -115,7 +115,10 @@
         cursorStyle: cursorStyleForXterm(styleState.cursorShape),
         allowTransparency: true,
         scrollback: 10000,
-        convertEol: false,
+        // Guest tools occasionally die leaving the tty at -opost (bare-LF output);
+        // convertEol makes the terminal CR-on-LF so output degrades gracefully
+        // instead of staircase-rendering. Verified harmless for proper \r\n output.
+        convertEol: true,
         disableStdin: true,  // iOS handles text input natively
         allowProposedApi: true,
         overviewRuler: {width: 0},

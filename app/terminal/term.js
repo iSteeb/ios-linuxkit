@@ -100,6 +100,7 @@ window.addEventListener('load', async () => {
             fontSize: styleState.fontSize,
             scrollbarWidth: 0,
             smoothScrollDuration: 0,
+            convertEol: true,
             theme: themeForGhostty(styleState),
         };
         term = new Terminal(terminalOptions);
