@@ -254,7 +254,10 @@ int main(int argc, char *const argv[]) {
     append_boot_env(envp, sizeof(envp), &p, "HOME=/root");
     append_boot_env(envp, sizeof(envp), &p, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
 #ifdef GUEST_ARM64
-    append_boot_env(envp, sizeof(envp), &p, "PYTHONMALLOC=malloc");
+    // Match kernel/exec.c policy: skipped entirely under ISH_NO_ENV_INJECTION.
+    if (!(getenv("ISH_NO_ENV_INJECTION") != NULL
+          && getenv("ISH_NO_ENV_INJECTION")[0] == '1'))
+        append_boot_env(envp, sizeof(envp), &p, "PYTHONMALLOC=malloc");
 #endif
     const char *term = getenv("TERM");
     if (term && term[0] != '\0')

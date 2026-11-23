@@ -202,15 +202,21 @@ do_exec:
             }
         }
         // Inject env vars that sys_execve would normally add.
-        // These are injected only if not already present.
+        // These are injected only if not already present. Kept in sync with
+        // the table in kernel/exec.c (which is the authoritative copy):
+        // NO_COLOR was removed there (a UX opinion the kernel shouldn't
+        // force), and ISH_NO_ENV_INJECTION=1 is honored here too.
+        static int no_env_injection = -1;
+        if (no_env_injection == -1)
+            no_env_injection = (getenv("ISH_NO_ENV_INJECTION") != NULL
+                                && getenv("ISH_NO_ENV_INJECTION")[0] == '1');
         static const char *inject_vars[] = {
             "GODEBUG=asyncpreemptoff=1",  // Disable Go async preemption
             "GOMAXPROCS=2",               // Limit Go thread count
-            "NO_COLOR=1",                 // Disable color output
             "PYTHONMALLOC=malloc",        // Bypass pymalloc arenas
             "PYTHONDONTWRITEBYTECODE=1",  // Skip .pyc generation
         };
-        for (size_t vi = 0; vi < sizeof(inject_vars)/sizeof(inject_vars[0]); vi++) {
+        for (size_t vi = 0; !no_env_injection && vi < sizeof(inject_vars)/sizeof(inject_vars[0]); vi++) {
             // Check if already present (search by prefix up to '=')
             const char *eq = strchr(inject_vars[vi], '=');
             size_t prefix_len = eq ? (size_t)(eq - inject_vars[vi] + 1) : strlen(inject_vars[vi]);

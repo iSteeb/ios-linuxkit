@@ -754,18 +754,35 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
     STRACE("})");
 
     // Force-inject environment variables into every execve'd process.
-    // mode=0: inject only if not present, mode=1: replace existing value
+    // mode=0: inject only if not present, mode=1: replace existing value.
+    // ISH_NO_ENV_INJECTION=1 skips this table (and the GODEBUG merge below)
+    // entirely — the kernel-level escape hatch for environments that want
+    // completely pristine exec environments (mirrors
+    // ISH_NODE_NO_ARG_INJECTION for the Node argv flags).
+    static bool no_env_injection = false;
+    static bool no_env_injection_checked = false;
+    if (!no_env_injection_checked) {
+        // Scan the INITIATOR's environment once: this runs before the guest
+        // envp exists, and the setting is a host/app-level knob, not a
+        // per-guest-process variable.
+        const char *e = getenv("ISH_NO_ENV_INJECTION");
+        no_env_injection = (e != NULL && e[0] == '1');
+        no_env_injection_checked = true;
+    }
+    if (!no_env_injection) {
     static const struct { const char *kv; size_t prefix_len; int mode; } inject_envs[] = {
         { "PYTHONMALLOC=malloc", 13, 1 },      // FORCE bypass pymalloc arenas (mode=1: always replace)
-        { "NO_COLOR=1", 9, 0 },                // Disable color output
         { "PIP_PROGRESS_BAR=off", 17, 0 },     // Disable pip progress bar
         { "PYTHONDONTWRITEBYTECODE=1", 25, 0 }, // Skip .pyc generation to reduce allocs
+        // (GODEBUG is handled separately below: it must MERGE into a
+        // user-provided value, not skip injection when one exists.)
+        // (NO_COLOR was removed: forcing it globally is a UX opinion the
+        // kernel has no business imposing; users who want it can export it.)
         // Go async preemption sends SIGURG and reads/modifies mcontext at a
         // fixed offset. Our JIT delivers signals at gadget boundaries, not at
         // the exact interrupted instruction, so the PC in the signal frame is
         // imprecise. cpu_poke reduces latency but can't fix PC precision.
         // Cooperative preemption (function-call checkpoints) works correctly.
-        { "GODEBUG=asyncpreemptoff=1", 8, 0 }, // Disable Go async preemption
         // Limit Go threads to reduce TLB stale-pointer crashes from concurrent
         // page table modifications. GOMAXPROCS=2 is sufficient for most Go CLI
         // tools and eliminates nearly all multi-thread race conditions.
@@ -809,6 +826,38 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
         }
     }
 
+    // GODEBUG is a comma-separated list, so a user-provided value (e.g.
+    // GODEBUG=gctrace=1) must not silently drop asyncpreemptoff, whose
+    // absence breaks Go signal delivery under emulation. If GODEBUG is set
+    // without it, rewrite the value to include it. Values too long to merge
+    // safely (or a buffer already at ARGV_MAX) are left untouched — the same
+    // net behaviour as before this fix.
+    {
+        char *godebug = NULL;
+        for (char *e = envp; *e != '\0'; e += strlen(e) + 1) {
+            if (strncmp(e, "GODEBUG=", 8) == 0)
+                godebug = e;
+        }
+        if (godebug != NULL && strstr(godebug, "asyncpreemptoff") == NULL) {
+            char *e = envp;
+            while (*e != '\0')
+                e += strlen(e) + 1;
+            size_t total_used = (e - envp) + 1; // includes final \0
+            size_t old_len = strlen(godebug) + 1;
+            char merged[1024];
+            int n = snprintf(merged, sizeof(merged), "%s,asyncpreemptoff=1", godebug);
+            if (n > 0 && (size_t)n < sizeof(merged) &&
+                    total_used - old_len + (size_t)n + 1 + 1 <= ARGV_MAX) {
+                size_t tail = total_used - (godebug - envp) - old_len;
+                memmove(godebug, godebug + old_len, tail);
+                total_used -= old_len;
+                memcpy(envp + total_used - 1, merged, (size_t)n + 1);
+                envp[total_used - 1 + (size_t)n + 1] = '\0';
+            }
+        }
+    }
+    } // !no_env_injection
+
     // Inject V8 flags for Node.js to work around scope corruption in emulation.
     // --jitless: disable JIT (avoids V8 code generation incompatible with our JIT)
     // --predictable: disable concurrent GC/compilation (avoids race conditions)
@@ -823,7 +872,10 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
     {
         const char *base = strrchr(filename, '/');
         base = base ? base + 1 : filename;
-        if (strcmp(base, "node") == 0) {
+        // Match both spellings: "node" is upstream's name, but distros (and
+        // some package managers) install it as "nodejs".
+        bool is_node_binary = (strcmp(base, "node") == 0 || strcmp(base, "nodejs") == 0);
+        if (is_node_binary) {
             bool skip_node_arg_injection = false;
             for (char *e = envp; *e != '\0'; e += strlen(e) + 1) {
                 if (strcmp(e, "ISH_NODE_NO_ARG_INJECTION=1") == 0) {
@@ -890,7 +942,7 @@ node_arg_injection_done: ;
         // V8's Zone allocator reuses freed memory without zeroing, causing
         // stale pointer dereferences. This library zeros blocks >= 4096 bytes
         // on both malloc and free (Zone segments are >= 8KB).
-        if (strcmp(base, "node") == 0) {
+        if (is_node_binary) {
             struct fd *zero_free_fd = generic_open("/lib/zero_free.so", O_RDONLY_, 0);
             if (!IS_ERR(zero_free_fd)) {
                 fd_close(zero_free_fd);
