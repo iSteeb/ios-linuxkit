@@ -124,6 +124,8 @@
 		AA000042AF96D90D00FFB7A4 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = BB792B5E1F96D90D00FFB7A4 /* LaunchScreen.storyboard */; };
 		AA000043AF96D90D00FFB7A4 /* Settings.bundle in Resources */ = {isa = PBXBuildFile; fileRef = BBBF7B5B2415CDBB00EC4C14 /* Settings.bundle */; };
 		AA000044AF96D90D00FFB7A4 /* Icons.plist in Resources */ = {isa = PBXBuildFile; fileRef = BB0F552D239F8A790032A2A1 /* Icons.plist */; };
+		AA0005Y1AF96D90D00FFB7A4 /* AppIcon60x60@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = AA0005X1AF96D90D00FFB7A4 /* AppIcon60x60@3x.png */; };
+		AA0005Y2AF96D90D00FFB7A4 /* AppIcon83.5x83.5@2x~ipad.png in Resources */ = {isa = PBXBuildFile; fileRef = AA0005X2AF96D90D00FFB7A4 /* AppIcon83.5x83.5@2x~ipad.png */; };
 		AA0005A00AF96D90D00FFB7A /* 3d.png in Resources */ = {isa = PBXBuildFile; fileRef = BB4A923124EDA560002F5A96 /* 3d.png */; };
 		AA0005B01AF96D90D00FFB7A /* circular.png in Resources */ = {isa = PBXBuildFile; fileRef = BB38597627BCEC70000A1082 /* circular.png */; };
 		AA0005C02AF96D90D00FFB7A /* colontildehash.png in Resources */ = {isa = PBXBuildFile; fileRef = BB4A922F24EDA55C002F5A96 /* colontildehash.png */; };
@@ -868,6 +870,8 @@
 		BBBF7B5B2415CDBB00EC4C14 /* Settings.bundle */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.plug-in"; path = Settings.bundle; sourceTree = "<group>"; };
 		CC000001AF96D90D00FFB7A4 /* RootfsPatch.bundle */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.plug-in"; path = RootfsPatch.bundle; sourceTree = "<group>"; };
 		CC000011AF96D90D00FFB7A4 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		AA0005X1AF96D90D00FFB7A4 /* AppIcon60x60@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon60x60@3x.png"; sourceTree = "<group>"; };
+		AA0005X2AF96D90D00FFB7A4 /* AppIcon83.5x83.5@2x~ipad.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon83.5x83.5@2x~ipad.png"; sourceTree = "<group>"; };
 		BBBF9CBB27C217A6002A30F7 /* PasteboardDeviceLinux.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = PasteboardDeviceLinux.c; sourceTree = "<group>"; };
 		BBBF9CC027C441C0002A30F7 /* fix_path.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = fix_path.h; sourceTree = "<group>"; };
 		BBBF9CC127C441C0002A30F7 /* fake-db.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "fake-db.h"; sourceTree = "<group>"; };
@@ -1251,6 +1255,8 @@
 				BBBF7B5B2415CDBB00EC4C14 /* Settings.bundle */,
 				CC000001AF96D90D00FFB7A4 /* RootfsPatch.bundle */,
 				CC000011AF96D90D00FFB7A4 /* PrivacyInfo.xcprivacy */,
+				AA0005X1AF96D90D00FFB7A4 /* AppIcon60x60@3x.png */,
+				AA0005X2AF96D90D00FFB7A4 /* AppIcon83.5x83.5@2x~ipad.png */,
 				BB792B5C1F96D90D00FFB7A4 /* Assets.xcassets */,
 				BB1B9A4123A5E92A00414052 /* Icons */,
 				BB792B5E1F96D90D00FFB7A4 /* LaunchScreen.storyboard */,
@@ -2045,6 +2051,8 @@
 				AA0005S18AF96D90D00FFB7A /* rgb.png in Resources */,
 				AA0005T19AF96D90D00FFB7A /* sprite64.png in Resources */,
 				AA0005U20AF96D90D00FFB7A /* uninspired.png in Resources */,
+				AA0005Y1AF96D90D00FFB7A4 /* AppIcon60x60@3x.png in Resources */,
+				AA0005Y2AF96D90D00FFB7A4 /* AppIcon83.5x83.5@2x~ipad.png in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -3067,7 +3075,7 @@
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = BB0B85A42586F1CB00208600 /* ProjectDebug.xcconfig */;
 			buildSettings = {
-				CURRENT_PROJECT_VERSION = 830;
+				CURRENT_PROJECT_VERSION = 831;
 			};
 			name = "Debug-ApplePleaseFixFB19282108";
 		};
@@ -3075,7 +3083,7 @@
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = BB0B85A52586F1E100208600 /* ProjectRelease.xcconfig */;
 			buildSettings = {
-				CURRENT_PROJECT_VERSION = 830;
+				CURRENT_PROJECT_VERSION = 831;
 			};
 			name = Release;
 		};
@@ -3099,7 +3107,7 @@
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = BB28C7532689522C00BDC834 /* ProjectDebugLinux.xcconfig */;
 			buildSettings = {
-				CURRENT_PROJECT_VERSION = 830;
+				CURRENT_PROJECT_VERSION = 831;
 			};
 			name = DebugLinux;
 		};
@@ -3349,7 +3357,7 @@
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = BB28C7522689522700BDC834 /* ProjectReleaseLinux.xcconfig */;
 			buildSettings = {
-				CURRENT_PROJECT_VERSION = 830;
+				CURRENT_PROJECT_VERSION = 831;
 			};
 			name = ReleaseLinux;
 		};
