@@ -42,6 +42,29 @@ __attribute__((constructor)) static void detect_host_sha512(void) {
 #endif
 }
 
+/* FEAT_SHA3 (EOR3) is optional on hardware that has the rest of the crypto
+ * extension (absent on Apple A11 and earlier, present from A13/M1 on).
+ * Same probe rules as SHA512: only "0" is an override; never probe by
+ * executing. ISH_HOST_SHA3=0 forces the C fallback for A/B testing.
+ */
+unsigned char ish_host_sha3 = 0;
+
+__attribute__((constructor)) static void detect_host_sha3(void) {
+    const char *force = getenv("ISH_HOST_SHA3");
+    ish_host_sha3 = 0;
+    if (force != NULL && strcmp(force, "0") == 0)
+        return;
+#if defined(__APPLE__) && defined(__aarch64__)
+    int value = 0;
+    size_t size = sizeof(value);
+    if (sysctlbyname("hw.optional.arm.FEAT_SHA3", &value, &size, NULL, 0) != 0)
+        return;
+    ish_host_sha3 = size == sizeof(value) && value != 0;
+#elif defined(__linux__) && defined(__aarch64__) && defined(HWCAP_SHA3)
+    ish_host_sha3 = (getauxval(AT_HWCAP) & HWCAP_SHA3) != 0;
+#endif
+}
+
 /* AES S-box */
 static const uint8_t aes_sbox[256] = {
     0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,

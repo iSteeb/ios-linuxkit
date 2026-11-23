@@ -1,10 +1,10 @@
 /*
  * ARM64 Cryptographic Extension Gadgets
  *
- * AES, SHA1, SHA256, and supported SHA512 gadgets use native .inst
- * instructions. SHA512 falls back to C without host FEAT_SHA512.
- * Other crypto gadgets (EOR3, SM3, SM4,
- * PMULL, TBL/TBX, SVE) still use C helper functions.
+ * AES, SHA1, SHA256, EOR3 (host FEAT_SHA3), PMULL/PMULL2 and TBL/TBX use
+ * native .inst instructions. SHA512 falls back to C without host
+ * FEAT_SHA512, EOR3 without host FEAT_SHA3. SM3, SM4 and SVE still use C
+ * helper functions.
  */
 
 #include "gadgets.h"
@@ -19,6 +19,20 @@
 #else
     adrp x8, :got:NAME(ish_host_sha512)
     ldr x8, [x8, :got_lo12:NAME(ish_host_sha512)]
+#endif
+    ldrb w8, [x8]
+    cbz w8, .L\name\()_soft
+.endm
+
+// Same gate for FEAT_SHA3 (EOR3): absent on Apple A11 and earlier, present
+// on A13/M1+. Never probe by executing; the C helper is the fallback.
+.macro sha3_check name
+#if defined(__APPLE__)
+    adrp x8, NAME(ish_host_sha3)@GOTPAGE
+    ldr x8, [x8, NAME(ish_host_sha3)@GOTPAGEOFF]
+#else
+    adrp x8, :got:NAME(ish_host_sha3)
+    ldr x8, [x8, :got_lo12:NAME(ish_host_sha3)]
 #endif
     ldrb w8, [x8]
     cbz w8, .L\name\()_soft
@@ -528,6 +542,9 @@
 /*
  * EOR3 Vd.16B, Vn.16B, Vm.16B, Va.16B
  * Code stream: [gadget addr][rd | rn<<8 | rm<<16 | ra<<24]
+ *
+ * Native when the host has FEAT_SHA3 (Apple A13/M1+); otherwise the C
+ * helper below. EOR3 fully overwrites Vd, so v0 needs no initial load.
  */
 .gadget eor3
     ldr x8, [_pc]
@@ -540,6 +557,17 @@
 
     add x13, _cpu, #CPU_fp
 
+    sha3_check eor3
+
+    ldr q1, [x13, x10, lsl #4]
+    ldr q2, [x13, x11, lsl #4]
+    ldr q3, [x13, x12, lsl #4]
+    .inst 0xce020c20         // eor3 v0.16b, v1.16b, v2.16b, v3.16b
+    str q0, [x13, x9, lsl #4]
+
+    gret
+
+.Leor3_soft:
     stp x19, x20, [sp, #-0x60]!
     stp x21, x22, [sp, #0x10]
     stp x23, x24, [sp, #0x20]
@@ -729,6 +757,12 @@
 /*
  * PMULL - Polynomial Multiply Long
  * Code stream: [gadget addr][rd | rn<<8 | rm<<16 | Q<<24 | size<<26]
+ *
+ * All four legal forms are native: PMULL shares the v8.0 crypto extension
+ * with AESE, which this file already assumes. The destination is fully
+ * overwritten in every form, so v0 needs no load. Sizes 01/10 are rejected
+ * by the decoder (UNDEF) and can't arrive; the C path below only remains
+ * as a defensive fallback for unusual packings.
  */
 .gadget pmull
     ldr x8, [_pc]
@@ -742,6 +776,34 @@
 
     add x12, _cpu, #CPU_fp
 
+    cbz x22, .Lpmull_s0
+    cmp x22, #3
+    b.eq .Lpmull_s3
+    b .Lpmull_soft
+
+.Lpmull_s0:
+    ldr q1, [x12, x10, lsl #4]
+    ldr q2, [x12, x11, lsl #4]
+    cbz x21, .Lpmull_s0_q0
+    .inst 0x4e22e020        // pmull2 v0.8h, v1.16b, v2.16b
+    b .Lpmull_done
+.Lpmull_s0_q0:
+    .inst 0x0e22e020        // pmull v0.8h, v1.8b, v2.8b
+    b .Lpmull_done
+.Lpmull_s3:
+    ldr q1, [x12, x10, lsl #4]
+    ldr q2, [x12, x11, lsl #4]
+    cbz x21, .Lpmull_s3_q0
+    .inst 0x4ee2e020        // pmull2 v0.1q, v1.2d, v2.2d
+    b .Lpmull_done
+.Lpmull_s3_q0:
+    .inst 0x0ee2e020        // pmull v0.1q, v1.1d, v2.1d
+.Lpmull_done:
+    str q0, [x12, x9, lsl #4]
+
+    gret
+
+.Lpmull_soft:
     stp x19, x20, [sp, #-0x60]!
     stp x21, x22, [sp, #0x10]
     stp x23, x24, [sp, #0x20]
@@ -787,46 +849,54 @@
     and x9, x8, #0x1f       // rd
     ubfx x10, x8, #8, #5    // rn (first table register)
     ubfx x11, x8, #16, #5   // rm (indices)
-    ubfx x20, x8, #24, #3   // len (0-3 means 1-4 registers)
-    ubfx x21, x8, #28, #1   // Q (0=8B, 1=16B)
+    ubfx x12, x8, #24, #2   // len (0-3 means 1-4 registers)
+    ubfx x13, x8, #28, #1   // Q (0=8B, 1=16B)
 
-    add x12, _cpu, #CPU_fp
+    add x14, _cpu, #CPU_fp
+    // Load the (up to) four consecutive table registers, wrapping at v31,
+    // plus the index register. Unused table loads cost three 16-byte reads
+    // at most - still an order of magnitude cheaper than the old C call.
+    and x15, x10, #0x1f
+    ldr q1, [x14, x15, lsl #4]
+    add x15, x10, #1
+    and x15, x15, #0x1f
+    ldr q2, [x14, x15, lsl #4]
+    add x15, x10, #2
+    and x15, x15, #0x1f
+    ldr q3, [x14, x15, lsl #4]
+    add x15, x10, #3
+    and x15, x15, #0x1f
+    ldr q4, [x14, x15, lsl #4]
+    ldr q5, [x14, x11, lsl #4]
 
-    // Save callee-saved registers
-    stp x19, x20, [sp, #-0x60]!
-    stp x21, x22, [sp, #0x10]
-    stp x23, x24, [sp, #0x20]
-    stp x25, x26, [sp, #0x30]
-    stp x27, x28, [sp, #0x40]
-    str lr, [sp, #0x50]
+    // Each site below is exactly 8 bytes (inst + branch), so the site table
+    // is addressable as base + (Q*4 + len) * 8 with no data relocations.
+    lsl x15, x13, #2        // Q * 4
+    orr x15, x15, x12       // + len
+    adr x16, .Ltbl_base
+    add x16, x16, x15, lsl #3
+    br x16
 
-    // Recalculate from saved x8 (clobbered by saves)
-    and x19, x8, #0x1f       // rd
-    ubfx x20, x8, #8, #5     // rn
-    ubfx x21, x8, #16, #5    // rm
-    ubfx x22, x8, #24, #3    // len
-    ubfx x23, x8, #28, #1    // Q
-
-    save_c
-    // tbl_helper(rd_ptr, rn_ptr, rm_ptr, len, Q, fp_base)
-    lsl x0, x19, #4
-    add x0, x12, x0         // rd_ptr
-    lsl x1, x20, #4
-    add x1, x12, x1         // rn_ptr (table start)
-    lsl x2, x21, #4
-    add x2, x12, x2         // rm_ptr (indices)
-    mov w3, w22             // len
-    mov w4, w23             // Q
-    mov x5, x12             // fp_base (for register wrap)
-    bl NAME(tbl_helper)
-    restore_c
-
-    ldr lr, [sp, #0x50]
-    ldp x27, x28, [sp, #0x40]
-    ldp x25, x26, [sp, #0x30]
-    ldp x23, x24, [sp, #0x20]
-    ldp x21, x22, [sp, #0x10]
-    ldp x19, x20, [sp], #0x60
+.Ltbl_base:
+    .inst 0x0e050020        // tbl v0.8b, {v1.16b}, v5.8b
+    b .Ltbl_done
+    .inst 0x0e052020        // tbl v0.8b, {v1.16b, v2.16b}, v5.8b
+    b .Ltbl_done
+    .inst 0x0e054020        // tbl v0.8b, {v1.16b-v3.16b}, v5.8b
+    b .Ltbl_done
+    .inst 0x0e056020        // tbl v0.8b, {v1.16b-v4.16b}, v5.8b
+    b .Ltbl_done
+    .inst 0x4e050020        // tbl v0.16b, {v1.16b}, v5.16b
+    b .Ltbl_done
+    .inst 0x4e052020        // tbl v0.16b, {v1.16b, v2.16b}, v5.16b
+    b .Ltbl_done
+    .inst 0x4e054020        // tbl v0.16b, {v1.16b-v3.16b}, v5.16b
+    b .Ltbl_done
+    .inst 0x4e056020        // tbl v0.16b, {v1.16b-v4.16b}, v5.16b
+.Ltbl_done:
+    // The 8B forms zero the top half of Vd, matching guest semantics, so a
+    // full 16-byte store is always correct.
+    str q0, [x14, x9, lsl #4]
 
     gret
 
@@ -844,45 +914,49 @@
     and x9, x8, #0x1f       // rd
     ubfx x10, x8, #8, #5    // rn (first table register)
     ubfx x11, x8, #16, #5   // rm (indices)
-    ubfx x20, x8, #24, #3   // len (0-3 means 1-4 registers)
-    ubfx x21, x8, #28, #1   // Q (0=8B, 1=16B)
+    ubfx x12, x8, #24, #2   // len (0-3 means 1-4 registers)
+    ubfx x13, x8, #28, #1   // Q (0=8B, 1=16B)
 
-    add x12, _cpu, #CPU_fp
+    add x14, _cpu, #CPU_fp
+    and x15, x10, #0x1f
+    ldr q1, [x14, x15, lsl #4]
+    add x15, x10, #1
+    and x15, x15, #0x1f
+    ldr q2, [x14, x15, lsl #4]
+    add x15, x10, #2
+    and x15, x15, #0x1f
+    ldr q3, [x14, x15, lsl #4]
+    add x15, x10, #3
+    and x15, x15, #0x1f
+    ldr q4, [x14, x15, lsl #4]
+    ldr q5, [x14, x11, lsl #4]
+    // TBX preserves Vd bytes whose index is out of range, so Vd must be
+    // loaded (TBL above can skip this: it fully overwrites).
+    ldr q0, [x14, x9, lsl #4]
 
-    // Save callee-saved registers
-    stp x19, x20, [sp, #-0x60]!
-    stp x21, x22, [sp, #0x10]
-    stp x23, x24, [sp, #0x20]
-    stp x25, x26, [sp, #0x30]
-    stp x27, x28, [sp, #0x40]
-    str lr, [sp, #0x50]
+    lsl x15, x13, #2        // Q * 4
+    orr x15, x15, x12       // + len
+    adr x16, .Ltbx_base
+    add x16, x16, x15, lsl #3
+    br x16
 
-    // Recalculate from saved x8 (clobbered by saves)
-    and x19, x8, #0x1f       // rd
-    ubfx x20, x8, #8, #5     // rn
-    ubfx x21, x8, #16, #5    // rm
-    ubfx x22, x8, #24, #3    // len
-    ubfx x23, x8, #28, #1    // Q
-
-    save_c
-    // tbx_helper(rd_ptr, rn_ptr, rm_ptr, len, Q, fp_base)
-    lsl x0, x19, #4
-    add x0, x12, x0         // rd_ptr
-    lsl x1, x20, #4
-    add x1, x12, x1         // rn_ptr (table start)
-    lsl x2, x21, #4
-    add x2, x12, x2         // rm_ptr (indices)
-    mov w3, w22             // len
-    mov w4, w23             // Q
-    mov x5, x12             // fp_base (for register wrap)
-    bl NAME(tbx_helper)
-    restore_c
-
-    ldr lr, [sp, #0x50]
-    ldp x27, x28, [sp, #0x40]
-    ldp x25, x26, [sp, #0x30]
-    ldp x23, x24, [sp, #0x20]
-    ldp x21, x22, [sp, #0x10]
-    ldp x19, x20, [sp], #0x60
+.Ltbx_base:
+    .inst 0x0e051020        // tbx v0.8b, {v1.16b}, v5.8b
+    b .Ltbx_done
+    .inst 0x0e053020        // tbx v0.8b, {v1.16b, v2.16b}, v5.8b
+    b .Ltbx_done
+    .inst 0x0e055020        // tbx v0.8b, {v1.16b-v3.16b}, v5.8b
+    b .Ltbx_done
+    .inst 0x0e057020        // tbx v0.8b, {v1.16b-v4.16b}, v5.8b
+    b .Ltbx_done
+    .inst 0x4e051020        // tbx v0.16b, {v1.16b}, v5.16b
+    b .Ltbx_done
+    .inst 0x4e053020        // tbx v0.16b, {v1.16b, v2.16b}, v5.16b
+    b .Ltbx_done
+    .inst 0x4e055020        // tbx v0.16b, {v1.16b-v3.16b}, v5.16b
+    b .Ltbx_done
+    .inst 0x4e057020        // tbx v0.16b, {v1.16b-v4.16b}, v5.16b
+.Ltbx_done:
+    str q0, [x14, x9, lsl #4]
 
     gret

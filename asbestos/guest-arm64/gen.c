@@ -6997,11 +6997,15 @@ skip_three_different:
         uint32_t rm = (insn >> 16) & 0x1f;
         uint32_t Q = (insn >> 30) & 1;
         uint32_t size = (insn >> 22) & 0x3;
-
-
-        gen(state, (unsigned long) gadget_pmull);
-        gen(state, rd | (rn << 8) | (rm << 16) | (Q << 24) | (size << 26));
-        return 1;
+        // The mask checks bit 21 (the fixed "1" of the pattern) and leaves
+        // bits 23:22 free, so both size=00 and size=11 forms match. Sizes
+        // 01/10 are UNDEFINED per the ARM ARM (PMUL has a different opcode
+        // field and never lands here) and fall through to UNDEF.
+        if (size == 0 || size == 3) {
+            gen(state, (unsigned long) gadget_pmull);
+            gen(state, rd | (rn << 8) | (rm << 16) | (Q << 24) | (size << 26));
+            return 1;
+        }
     }
 
     // AdvSIMD scalar x indexed element
