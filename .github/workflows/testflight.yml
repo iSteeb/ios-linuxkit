@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Release pipeline, adapted from OrcaPad's TestFlight CI (same author).
+# Runs ONLY when a `release*` tag is pushed (keeps Beta App Review from being
+# flooded). Every such build goes to the external TestFlight group:
+#   testflight  macOS (Xcode 27): meson+ninja -> xcodebuild archive with
+#               manual App Store signing (temp keychain) -> checks ->
+#               export -> altool validate + upload, then the build is added
+#               to the external group and submitted for Beta App Review
+#               (Distribution/asc_testflight.py).
+#
+# Release: git tag release-1.0.0 && git push origin release-1.0.0
+#   (a `release-X.Y.Z` tag sets the app version; plain `release*` tags keep
+#   the MARKETING_VERSION from the project)
+#
+# Repository setup (once):
+#   environment "testflight" (deployment tag: release*)
+#   secrets   DIST_P12_BASE64, DIST_P12_PASSWORD, APPSTORE_PROFILE_BASE64, ASC_KEY_P8
+#   variables ASC_KEY_ID, ASC_ISSUER_ID, TESTFLIGHT_GROUP (external group name)
+#
+# The DIST_P12 is an Apple Distribution identity export; the APPSTORE_PROFILE
+# is an App Store provisioning profile for dev.isteeb.linuxkit ("termulator
+# App Store"). See docs/TESTFLIGHT.md for how they are produced.
+name: Release to TestFlight
+
+on:
+  push:
+    tags: ['release*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-testflight
+  cancel-in-progress: false
+
+env:
+  XCODE_APP: /Applications/Xcode_27.app
+
+jobs:
+  testflight:
+    name: Archive, upload, submit to external TestFlight
+    runs-on: xcode-27
+    timeout-minutes: 150
+    environment: testflight
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select Xcode 27
+        run: |
+          [ -d "$XCODE_APP" ] || { echo "::error::$XCODE_APP is not on this image"; exit 1; }
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          case "$(xcodebuild -version | awk 'NR==1 {print $2}')" in
+            27.*) ;;
+            *) echo "::error::expected Xcode 27"; exit 1 ;;
+          esac
+      - name: Install meson + ninja (the ARM64 build phase drives meson)
+        run: |
+          brew install meson ninja
+          meson --version
+          ninja --version
+      - name: Release notes ("What to Test")
+        id: notes
+        run: |
+          notes="$RUNNER_TEMP/whats-new.txt"
+          previous="$(git for-each-ref --count=1 --sort=-creatordate --merged "$GITHUB_SHA^" \
+                       --format='%(refname:short)' 'refs/tags/release*')"
+          {
+            if [ "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = tag ]; then
+              git tag --list --format='%(contents)' "$GITHUB_REF_NAME"
+            fi
+            if [ -n "$previous" ]; then
+              echo "Changes since $previous:"
+              git log --no-merges --format='- %s' "$previous..$GITHUB_SHA"
+            else
+              echo "Changes:"
+              git log --no-merges --format='- %s' -30 "$GITHUB_SHA"
+            fi
+          } > "$notes"
+          cat "$notes"
+          version=""
+          if [[ "$GITHUB_REF_NAME" =~ ^release-v?([0-9]+\.[0-9]+(\.[0-9]+)?)$ ]]; then
+            version="${BASH_REMATCH[1]}"
+          fi
+          echo "marketing_version=$version" >> "$GITHUB_OUTPUT"
+      - name: Archive, check, export, upload
+        id: upload
+        timeout-minutes: 90
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+          MARKETING_VERSION: ${{ steps.notes.outputs.marketing_version }}
+          DIST_P12_BASE64: ${{ secrets.DIST_P12_BASE64 }}
+          DIST_P12_PASSWORD: ${{ secrets.DIST_P12_PASSWORD }}
+          APPSTORE_PROFILE_BASE64: ${{ secrets.APPSTORE_PROFILE_BASE64 }}
+          ASC_KEY_ID: ${{ vars.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ vars.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: bash Distribution/release-testflight.sh
+      - name: Submit to the external TestFlight group
+        timeout-minutes: 60
+        env:
+          ASC_KEY_ID: ${{ vars.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ vars.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          TESTFLIGHT_GROUP: ${{ vars.TESTFLIGHT_GROUP }}
+          VERSION: ${{ steps.upload.outputs.version }}
+          BUILD: ${{ steps.upload.outputs.build }}
+        run: |
+          python3 Distribution/asc_testflight.py --bundle-id dev.isteeb.linuxkit \
+            --version "$VERSION" --build "$BUILD" --group "$TESTFLIGHT_GROUP" \
+            --notes-file "$RUNNER_TEMP/whats-new.txt"
