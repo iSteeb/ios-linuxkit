@@ -11,7 +11,3 @@ CODE_SIGN_ENTITLEMENTS = app/iSH.entitlements
 HEADER_SEARCH_PATHS = $(inherited) $(SRCROOT) $(SRCROOT)/deps/libarchive/libarchive
 // AccessibilityFixes.m contains a static constructor that we don't want removed
 OTHER_LDFLAGS = -ObjC $(LINUX_APP_LDFLAGS) -u _accessibilityfixes_init
-
-// Alternate app icons ship as asset-catalog appiconsets (<name>.appiconset).
-// actool emits every required size and the CFBundleAlternateIcons plist entries.
-ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES = 3d circular colontildehash dollarblock1 dollarblock2 freeiosterminal icon1337 idollarhash ihash1 iinhash is ishcolontildehash metal notsurewhatthisis pydann1 pydann2 reworked rgb sprite64 uninspired
