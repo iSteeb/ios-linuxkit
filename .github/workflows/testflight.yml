@@ -61,6 +61,17 @@ jobs:
           brew install meson ninja
           meson --version
           ninja --version
+      - name: Compute build number
+        id: buildno
+        # CFBundleVersion must exceed every previously uploaded build. Manual
+        # uploads before the pipeline existed reached 835; the project's
+        # CURRENT_PROJECT_VERSION is that floor, and each CI run adds its
+        # run_number on top (first run -> 836, strictly increasing forever).
+        run: |
+          floor="$(sed -n 's/.*CURRENT_PROJECT_VERSION = \([0-9]*\);.*/\1/p' iSH.xcodeproj/project.pbxproj | sort -n | tail -1)"
+          build="$((floor + GITHUB_RUN_NUMBER))"
+          echo "build=$build (floor $floor + run $GITHUB_RUN_NUMBER)"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
       - name: Release notes ("What to Test")
         id: notes
         run: |
@@ -89,7 +100,7 @@ jobs:
         id: upload
         timeout-minutes: 90
         env:
-          BUILD_NUMBER: ${{ github.run_number }}
+          BUILD_NUMBER: ${{ steps.buildno.outputs.build }}
           MARKETING_VERSION: ${{ steps.notes.outputs.marketing_version }}
           DIST_P12_BASE64: ${{ secrets.DIST_P12_BASE64 }}
           DIST_P12_PASSWORD: ${{ secrets.DIST_P12_PASSWORD }}
